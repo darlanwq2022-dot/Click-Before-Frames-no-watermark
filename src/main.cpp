@@ -1,4 +1,4 @@
-// Predictive Input Buffer v3.0.2 (native GD physics + FPS-neutral scheduling + wave reliability + build fix)
+// Predictive Input Buffer v3.0.4 (wave diagnostics declaration-order build fix)
 //
 // When you click (or release, in wave / robot), a hidden "ghost" player is simulated
 // ahead with your input. If the ghost dies, the input is retried with 1..N ticks of
@@ -783,6 +783,9 @@ namespace {
     }
 
     size_t memorySpots();
+    int learnedWavePressHoldForLog();
+    int learnedWaveReleaseGapForLog();
+    int waveNextToggleForLog();
 
     // v2.29 F8: copy the console to the clipboard (and save it to console-export.txt in the
     // mod's save folder), with the version, level, physics rate and settings on top, so it
@@ -816,7 +819,7 @@ namespace {
         text += fmt::format("orbs: align {} (ground {}, {}t) timing {} assume {} both {} | memory {} ({} spots) | skip failed spots {}\n", buf.orbAlign,
             buf.orbAlignGround, buf.orbWindow, buf.orbTiming, buf.assumeOrbs, buf.tryBothOrbs, buf.learn, memorySpots(), buf.skipFailedSpots);
         text += fmt::format("wave: v4.6 {} margin {} horizon {} learned press-hold {}t release-gap {}t next-toggle {}t | spam gap {} streak {} rapid bypass {} | robot smart {} | spider smart {} | ship {} (max {}t)\n",
-            buf.waveV46, buf.waveMargin, buf.waveHorizon, wavePressHold.pick(-1, 50), waveReleaseGap.pick(-1, 50), waveNextToggleAfter,
+            buf.waveV46, buf.waveMargin, buf.waveHorizon, learnedWavePressHoldForLog(), learnedWaveReleaseGapForLog(), waveNextToggleForLog(),
             buf.spamGap, buf.spamStreak, buf.rapidInputBypass, buf.robotSmart, buf.spiderSmart, buf.shipBuffer, buf.shipMaxDelay);
         text += fmt::format("auto-release: wave {} robot {} dash {} | auto-click {} | normal runs {} window {} | movers: avoid {} predict {}\n",
             buf.autoRelease, buf.robotAutoRelease, buf.dashAutoRelease, buf.autoClick, buf.autoNormalRuns, buf.autoWindow, buf.avoidMovers,
@@ -1152,6 +1155,11 @@ namespace {
     HoldStats wavePressHold, waveReleaseGap;
     int waveReleaseTick = -1;
     int tickCount = 0;
+
+    // Keep exportConsole() independent of declaration order: it is defined above the
+    // learned timing state, while these accessors are implemented after that state exists.
+    int learnedWavePressHoldForLog() { return wavePressHold.pick(-1, 50); }
+    int learnedWaveReleaseGapForLog() { return waveReleaseGap.pick(-1, 50); }
 
     enum class InputKind { Tap, Wave, Robot, Other };
     int pressTick = -1;
@@ -3178,6 +3186,7 @@ namespace {
     int searchFrom = 1;
     int budgetCutK = 0;
     int waveNextToggleAfter = -1;
+    int waveNextToggleForLog() { return waveNextToggleAfter; }
     // set while a search is going on from a previous tick
     bool resumeNow = false;
     QueuedInput resumeEntry {};
@@ -6921,7 +6930,7 @@ $on_mod(Loaded) {
 // the main menu: a heart button that opens the menu (with the other buttons at the bottom),
 // and the update check
 class $modify(BufMenuLayer, MenuLayer) {
-    bool init() {
+    bool init() override {
         CBF_STEP("main menu: game's menu");
         if (!MenuLayer::init()) {
             return false;

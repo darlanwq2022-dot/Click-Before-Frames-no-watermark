@@ -1,6 +1,12 @@
-# Predictive Input Buffer v3.0.3 — wave timing and FPS diagnostics
+# Predictive Input Buffer v3.0.4 — Wave diagnostic build fix
 
 Targets Geometry Dash 2.2081 / Geode 5.11.2.
+
+## v3.0.4 — Wave diagnostic build fix
+
+The Android/Clang build exposed three declaration-order errors in the diagnostic export: `exportConsole()` referenced the learned Wave press-hold, release-gap, and next-toggle state before those definitions appeared in the translation unit. The export now calls three small accessors declared before `exportConsole()` and implemented after the corresponding state is defined. This preserves the diagnostic values while fixing the compile error. The `MenuLayer::init()` hook is also explicitly marked `override`.
+
+No Wave scoring, input scheduling, physics cadence, or runtime buffering behavior changed in this build-fix release.
 
 ## v3.0.3 — fix for the reported DIOOZ GOD behavior
 
@@ -29,4 +35,4 @@ The default wave horizon is 240 native physics ticks. The maximum delay setting 
 
 ## Build
 
-Use the included GitHub Actions workflow or compile against the matching Geode SDK. The SDK is not installed in the authoring environment, so this source package does not include a compiled `.geode` binary. Static validation can be performed locally, but a successful Geode compile and in-game test are still required.
+Current source version: **3.0.4**. Use the included GitHub Actions workflow or compile against the matching Geode SDK. The SDK is not installed in the authoring environment, so this source package does not include a compiled `.geode` binary. Static validation can be performed locally, but a successful Geode compile and in-game test are still required.
