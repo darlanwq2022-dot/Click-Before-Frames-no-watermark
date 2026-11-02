@@ -1,4 +1,4 @@
-// Predictive Input Buffer v3.0.1 (native GD physics + FPS-neutral scheduling + wave reliability)
+// Predictive Input Buffer v3.0.2 (native GD physics + FPS-neutral scheduling + wave reliability + build fix)
 //
 // When you click (or release, in wave / robot), a hidden "ghost" player is simulated
 // ahead with your input. If the ghost dies, the input is retried with 1..N ticks of
@@ -2965,8 +2965,8 @@ namespace {
     // timings each), and of the timings that are fully safe the middle one is picked, so a
     // real run a hair off still makes it; with robust saves it must also survive starting
     // half a tick ahead / behind.
-    int alignOrb(PlayLayer* layer, PlayerObject* p1, PlayerObject* p2, bool dual, int horizon, int releaseAfter, int learned, int maxDelay,
-        int* landed) {
+    int alignOrb(PlayLayer* layer, PlayerObject* p1, PlayerObject* p2, bool dual, int horizon, int releaseAfter,
+        int learned, int maxDelay, int searchFrom, int* landed) {
         int window = st(std::clamp(buf.orbWindow, 1, 64));
         int found = 0;
         SimEnd end;
@@ -4390,7 +4390,7 @@ namespace {
         }
         if (down && !anyWave && !anyShip && buf.orbAlign && buf.smart && (!grounded || buf.orbAlignGround) && !resuming) {
             int orbLanded = 0;
-            int k = memorySaysSkip(sliceOf(p1)) ? 0 : alignOrb(layer, p1, p2, dual, horizon, releaseAfter, memoryDelay(sliceOf(p1)), maxDelay, &orbLanded);
+            int k = memorySaysSkip(sliceOf(p1)) ? 0 : alignOrb(layer, p1, p2, dual, horizon, releaseAfter, memoryDelay(sliceOf(p1)), maxDelay, searchFrom, &orbLanded);
             if (k > 0 && trainInstead(layer, k, down, "orb")) {
                 decided(layer, p1, p2, dual, 0, down, horizon, releaseAfter);
                 buf.appliedInput = down;
@@ -6008,7 +6008,7 @@ private:
     }
 
 protected:
-    bool init() {
+    bool init() override {
         if (!Popup::init(W, H, "GJ_square04.png")) {
             return false;
         }
@@ -6186,7 +6186,7 @@ $on_mod(Loaded) {
     if (Loader::get()->isModLoaded("square3ang.cbfextrapolate")) {
         say("CBF Extrapolate detected: visual only, predictions unaffected");
     }
-    say("v3.0.1 loaded. Native GD physics clock preserved; FPS-neutral prediction scheduling and expanded wave search");
+    say("v3.0.2 loaded. Native GD physics clock preserved; FPS-neutral prediction scheduling and expanded wave search");
 }
 
 class $modify(BufPlayLayer, PlayLayer) {

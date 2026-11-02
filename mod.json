@@ -6,7 +6,7 @@
     "mac": "2.2081",
     "ios": "2.2081"
   },
-  "version": "3.0.1",
+  "version": "3.0.2",
   "id": "basu.input-buffer",
   "name": "Predictive Input Buffer",
   "developer": "BASU",

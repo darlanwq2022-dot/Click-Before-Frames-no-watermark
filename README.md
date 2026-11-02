@@ -1,8 +1,14 @@
-# Predictive Input Buffer v3.0.1 — native physics and wave reliability
+# Predictive Input Buffer v3.0.2 — native physics and wave reliability
 
 Targets Geometry Dash 2.2081 / Geode 5.11.2.
 
-## What changed
+## v3.0.2 build fix
+
+- Fixed the compile error in `alignOrb`: the resumed-search lower bound (`searchFrom`) is now passed explicitly into the orb-alignment routine instead of being referenced before its declaration.
+- Marked the popup `init()` method as `override`, removing the corresponding Clang warning.
+- No gameplay behavior, physics timing, or prediction limits were changed by this build-only patch.
+
+## What changed in v3.0.1
 
 - Removed the mod's custom physics accumulator and `getModifiedDelta` override. Geometry Dash 2.2 owns its native 240-TPS fixed physics loop; the mod now calls the original game update exactly once and measures render cadence separately.
 - The predictor advances using the actual `PlayerObject::update(dt)` delivered by the game. Its 240-Hz tick windows are converted using the measured physics-step duration; render FPS is not used to scale prediction time or CPU budget.
