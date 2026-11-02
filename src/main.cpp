@@ -179,6 +179,8 @@ namespace {
         bool ghostSolo = false;       // v2.84: a dual ghost went through a solo portal (only P1 goes on)
         bool simSecond = false;       // v2.85: ghost 2 is being simulated (dual from the start, or after a dual portal)
         bool noHitch = true;          // v2.85: a search that ran out of time goes on next tick
+        bool rapidInputBypass = false;   // v2.99.7: opt-in bypass for very rapid repeated inputs
+        bool skipFailedSpots = false;// v2.99.7: opt-in memory blacklist, still remembers good delays by default
         std::vector<GameObject*> simEnabled;  // v2.85: switched-off objects a toggle switched on in this prediction
         bool nextClick = true;        // v2.83: plan two clicks ahead
         bool realInput = false;
@@ -602,6 +604,8 @@ namespace {
         buf.driftCheck = mod->getSettingValue<bool>("drift-check");
         buf.spamGap = static_cast<int>(mod->getSettingValue<int64_t>("wave-spam-gap"));
         buf.spamStreak = static_cast<int>(mod->getSettingValue<int64_t>("wave-spam-streak"));
+        buf.rapidInputBypass = mod->getSettingValue<bool>("rapid-input-bypass");
+        buf.skipFailedSpots = mod->getSettingValue<bool>("skip-failed-spots");
         buf.orbAlign = mod->getSettingValue<bool>("orb-align");
         buf.orbTiming = mod->getSettingValue<bool>("orb-timing");
         buf.orbAlignGround = mod->getSettingValue<bool>("orb-align-ground");
@@ -661,8 +665,9 @@ namespace {
         buf.userBudget = buf.budgetMs;
     }
 
-    // v2.76 auto budget: the budget setting is used as it is, and only cut (to 4 ms) while
-    // the game is already dropping frames. v2.75 also capped every click at 45% of a frame:
+    // v2.99.7 auto budget: cap a search at 8 ms during a detected frame hitch. This
+    // still prevents a 30 ms search from compounding the hitch, without starving the search
+    // as aggressively as the old 4 ms cap.
     // at 240+ fps that was 2 ms, too short for a long cube jump's search (Penumbral's first
     // jump: only +1..+5 delays were ever tried, so most clicks got no save).
     void clickBudget() {
@@ -677,7 +682,7 @@ namespace {
                 budget = std::min(budget, std::max(4.0, interval));
             }
             if (interval > 0.0 && frame > std::max(interval * 2.0, 20.0)) {
-                budget = std::min(budget, 4.0);
+                budget = std::min(budget, 8.0);
             }
         }
         buf.budgetMs = budget;
@@ -685,7 +690,7 @@ namespace {
 
     // v2.88 per-mode frames, kept in the mod's saved values (they start from your custom stage)
     constexpr char const* MODE_NAMES[] = { "Cube", "Ship", "Ball", "UFO", "Wave", "Robot", "Spider", "Swing" };
-    constexpr int MODE_TICKS_MAX = 40;  // 10 frames
+    constexpr int MODE_TICKS_MAX = 128; // 32 frames (240 Hz physics ticks)
 
     void readModeTicks() {
         auto* mod = Mod::get();
@@ -776,10 +781,10 @@ namespace {
             buf.userBudget, buf.autoBudget, buf.noHitch, buf.lowLatency, buf.smart, buf.fullState, buf.robustSaves, buf.lateCrash, buf.practiceOnly);
         text += fmt::format("input diagnostics: sequence {} | budget yields {} | resumes {} | deferred inputs {} | direct fallbacks {} | pending {} / deferred {}\n",
             buf.inputSequence, buf.budgetYields, buf.resumeCount, buf.deferredCount, buf.directFallbackCount, buf.queue.size(), buf.deferredInputs.size());
-        text += fmt::format("orbs: align {} (ground {}, {}t) timing {} assume {} both {} | memory {} ({} spots)\n", buf.orbAlign,
-            buf.orbAlignGround, buf.orbWindow, buf.orbTiming, buf.assumeOrbs, buf.tryBothOrbs, buf.learn, memorySpots());
-        text += fmt::format("wave: v4.6 {} margin {} horizon {} spam gap {} | robot smart {} | spider smart {} | ship {} (max {}t)\n",
-            buf.waveV46, buf.waveMargin, buf.waveHorizon, buf.spamGap, buf.robotSmart, buf.spiderSmart, buf.shipBuffer, buf.shipMaxDelay);
+        text += fmt::format("orbs: align {} (ground {}, {}t) timing {} assume {} both {} | memory {} ({} spots) | skip failed spots {}\n", buf.orbAlign,
+            buf.orbAlignGround, buf.orbWindow, buf.orbTiming, buf.assumeOrbs, buf.tryBothOrbs, buf.learn, memorySpots(), buf.skipFailedSpots);
+        text += fmt::format("wave: v4.6 {} margin {} horizon {} spam gap {} streak {} rapid bypass {} | robot smart {} | spider smart {} | ship {} (max {}t)\n",
+            buf.waveV46, buf.waveMargin, buf.waveHorizon, buf.spamGap, buf.spamStreak, buf.rapidInputBypass, buf.robotSmart, buf.spiderSmart, buf.shipBuffer, buf.shipMaxDelay);
         text += fmt::format("auto-release: wave {} robot {} dash {} | auto-click {} | normal runs {} window {} | movers: avoid {} predict {}\n",
             buf.autoRelease, buf.robotAutoRelease, buf.dashAutoRelease, buf.autoClick, buf.autoNormalRuns, buf.autoWindow, buf.avoidMovers,
             buf.predictMovers);
@@ -2345,7 +2350,9 @@ namespace {
 
     // Saves made here keep ending in deaths: the ghost is wrong at this spot, leave it alone.
     bool memorySaysSkip(int slice) {
-        if (!buf.learn) {
+        // v2.99.7: keep learning and reusing successful delays, but don't blacklist a spot
+        // by default. The user can opt into the conservative blacklist in the Prediction tab.
+        if (!buf.learn || !buf.skipFailedSpots) {
             return false;
         }
         auto spot = spotAround(slice);
@@ -3124,9 +3131,9 @@ namespace {
     // set while a search is going on from a previous tick
     bool resumeNow = false;
     QueuedInput resumeEntry {};
-    // Settings cap delay windows well below this. The old limit of four yielded searches
-    // forced a raw fallback on dense sections even though candidates were still untested.
-    constexpr int MAX_RESUMES = 256;
+    // The expanded custom window can reach 256 physics ticks. Leave enough continuation
+    // headroom for one resumable search to span that entire window without a limit fallback.
+    constexpr int MAX_RESUMES = 512;
 
     // v2.7 wave scoring, the wave version of the cube's "landed safely". A wave never
     // lands, so a run that keeps going one way eventually hits a wall even in a normal
@@ -4124,7 +4131,8 @@ namespace {
         bool anyUfo = p1->m_isBird || (p2 && p2->m_isBird);
         bool anyBall = p1->m_isBall || (p2 && p2->m_isBall);
         bool anySwing = p1->m_isSwing || (p2 && p2->m_isSwing);
-        if ((anyWave || anyShip || (anyUfo && buf.ufoSmart) || (anyBall && buf.ballSmart) || (anySwing && buf.swingSmart)) &&
+        if (buf.rapidInputBypass &&
+            (anyWave || anyShip || (anyUfo && buf.ufoSmart) || (anyBall && buf.ballSmart) || (anySwing && buf.swingSmart)) &&
             buf.rapid >= buf.spamStreak) {
             say("DIRECT INPUT: spam guard ({} fast inputs in a row, gap < {}t)", buf.rapid, spamGap);
             // v2.47: path view marks inputs that skipped prediction (gray dot on you), so a
@@ -4385,10 +4393,10 @@ namespace {
                 }
             }
             if (buf.baseEscape >= 0) {
-                say("DIRECT INPUT: safe with normal timing only if you react by t{} (otherwise crash at t{})", buf.baseEscape, buf.baseCrash);
+                say("PASS-THROUGH: current timing is safe if you react by t{} (otherwise crash at t{})", buf.baseEscape, buf.baseCrash);
             }
             else {
-                say("DIRECT INPUT: prediction says this timing is already safe for the {}t look-ahead", horizon);
+                say("PASS-THROUGH: prediction says this timing is already safe for the {}t look-ahead", horizon);
             }
             // v2.82: a robot press that's only safe with a hold unlike your usual one
             if (robotPress && baseHold > 0) {
@@ -4509,7 +4517,7 @@ namespace {
                 ++buf.directFallbackCount;
             }
             else {
-                say("DIRECT INPUT: no verified save for {} | dies in {}t | max delay {}t | best +{}t -> {}t of {}{}",
+                say("UNBUFFERED: no verified safe delay for {} | dies in {}t | max delay {}t | best +{}t -> {}t of {}{}",
                     down ? "press" : "release", base, maxDelay, dbgBestK, dbgBestRet, horizon,
                     exhaustedResumeLimit ? " | resume limit reached" : "",
                     !crashFixed ? "" : base < st(30) ? " - too late: waiting only makes it crash sooner" : " - same crash at any timing (next obstacle)");
@@ -4846,6 +4854,7 @@ class BufferMenu : public geode::Popup {
         { "plan-next-click", "Plan next click" },
         { "no-hitch-searches", "No-hitch searches" },
         { "level-memory", "Level memory" },
+        { "skip-failed-spots", "Skip repeated failed spots" },
         { "more-time-death-spots", "More time at deaths" },
     };
     static constexpr Option MODES[] = {
@@ -4862,6 +4871,7 @@ class BufferMenu : public geode::Popup {
         { "dash-auto-release", "Dash auto-release" },
         { "auto-click", "Auto-click" },
         { "auto-release-normal-runs", "Allow auto inputs in normal runs" },
+        { "rapid-input-bypass", "Rapid-input bypass" },
     };
     static constexpr Option TOOLS[] = {
         { "save-ding", "Sound on successful save" },
@@ -5364,7 +5374,7 @@ private:
             m_sliders.push_back({ i, x + 30.f, x + colW - 36.f, ry, track });
             m_modeValues[i] = label(m_page, "", 0.52f, m_cyan, { x + colW - 15.f, ry });
         }
-        label(m_page, "Drag a slider: half-frame steps, up to 10 frames. With this on, low latency's 1-frame limit doesn't apply.", 0.38f, m_muted,
+        label(m_page, "Drag a slider: half-frame steps, up to 32 frames. With this on, low latency's 1-frame limit doesn't apply.", 0.38f, m_muted,
             { SIDE + 14.f, 22.f }, { 0.f, 0.5f })->limitLabelWidth(W - SIDE - 28.f, 0.38f, 0.2f);
         refreshModes();
     }
@@ -5806,12 +5816,23 @@ $on_mod(Loaded) {
     buf.console = false; // clean UI build: never open a separate live console window
     buf.showPath = false; // path rendering is intentionally unavailable in this clean UI build
     recoverGlobals();
-    // Reliability fork migration: disable the old low-latency default once. That preset
-    // capped delay at 4 ticks and prediction at 3 ms, defeating long-window recovery.
+    // Reliability fork migration: keep Low Latency off and resume searches across ticks.
     if (!Mod::get()->getSavedValue<bool>("reliable-buffer-v2996", false)) {
         Mod::get()->setSettingValue<bool>("low-latency", false);
         Mod::get()->setSettingValue<bool>("no-hitch-searches", true);
         Mod::get()->setSavedValue("reliable-buffer-v2996", true);
+    }
+    // v2.99.7: the previous maximum was 64 x 240-Hz ticks (16 frames). Raise existing
+    // custom windows to 128 ticks (32 frames) once, and expose up to 256 ticks (64 frames).
+    if (!Mod::get()->getSavedValue<bool>("expanded-window-v2997", false)) {
+        auto* mod = Mod::get();
+        auto all = mod->getSettingValue<int64_t>("custom-ticks");
+        auto wave = mod->getSettingValue<int64_t>("custom-wave-ticks");
+        mod->setSettingValue<int64_t>("custom-ticks", std::max<int64_t>(128, all));
+        mod->setSettingValue<int64_t>("custom-wave-ticks", std::max<int64_t>(128, wave));
+        mod->setSettingValue<bool>("rapid-input-bypass", false);
+        mod->setSettingValue<bool>("skip-failed-spots", false);
+        mod->setSavedValue("expanded-window-v2997", true);
     }
     buf.stage = std::clamp(Mod::get()->getSavedValue<int>("stage", buf.stage), 0, STAGE_COUNT - 1);
     // v2.62: per-level settings off (switched off once): every level uses the same switches
@@ -5830,7 +5851,7 @@ $on_mod(Loaded) {
     if (Loader::get()->isModLoaded("square3ang.cbfextrapolate")) {
         say("CBF Extrapolate detected: visual only, predictions unaffected");
     }
-    say("v2.99.6 reliable-buffer build loaded. Searches resume across ticks; diagnostics are enabled");
+    say("v2.99.7 expanded-buffer build loaded. 32-frame custom windows; spam bypass and failed-spot blacklist are opt-in");
 }
 
 class $modify(BufPlayLayer, PlayLayer) {

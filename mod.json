@@ -6,27 +6,27 @@
     "mac": "2.2081",
     "ios": "2.2081"
   },
-  "version": "v2.99.6",
+  "version": "v2.99.7",
   "id": "basu.input-buffer",
   "name": "Predictive Input Buffer",
   "developer": "BASU",
-  "description": "Clean gameplay UI with resumable prediction searches, ordered deferred inputs, and detailed diagnostic logs.",
+  "description": "Expanded 32-frame custom buffer windows, opt-in wave spam bypass and failed-spot blacklist, adaptive prediction budget, and diagnostic logging.",
   "settings": {
     "custom-ticks": {
       "type": "int",
       "name": "Custom stage: max delay (ticks)",
-      "description": "Max delay for the CUSTOM stage (key 6), all modes except wave. 4 ticks = 1 frame at 60fps.",
-      "default": 40,
+      "description": "Max delay for the CUSTOM stage (key 6), all modes except wave. 4 ticks = 1 frame at 60fps. 128 = 32 frames; max 256 = 64 frames.",
+      "default": 128,
       "min": 1,
-      "max": 64
+      "max": 256
     },
     "custom-wave-ticks": {
       "type": "int",
       "name": "Custom stage: max wave delay (ticks)",
-      "description": "Max delay for the CUSTOM stage (key 6) while in wave.",
-      "default": 20,
+      "description": "Max delay for the CUSTOM stage (key 6) while in wave. 128 = 32 frames; max 256 = 64 frames.",
+      "default": 128,
       "min": 0,
-      "max": 64
+      "max": 256
     },
     "sim-budget-ms": {
       "type": "float",
@@ -424,6 +424,18 @@
         "arrow-step": 10,
         "big-arrows": false
       }
+    },
+    "skip-failed-spots": {
+      "type": "bool",
+      "name": "Skip repeated failed spots",
+      "description": "When enabled, level memory may skip buffering in locations where previous buffered inputs repeatedly ended in deaths. OFF by default: successful learned delays are still reused, but fresh searches are attempted instead of blacklisting the location.",
+      "default": false
+    },
+    "rapid-input-bypass": {
+      "type": "bool",
+      "name": "Rapid-input bypass",
+      "description": "When enabled, a streak of very fast inputs in wave, ship, UFO, ball or swing bypasses prediction and goes straight to the game to preserve raw rhythm. OFF by default so rapid presses/releases still get a prediction attempt.",
+      "default": false
     }
   },
   "resources": {
