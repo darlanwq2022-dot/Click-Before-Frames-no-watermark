@@ -6,11 +6,11 @@
     "mac": "2.2081",
     "ios": "2.2081"
   },
-  "version": "v2.99.5",
+  "version": "v2.99.6",
   "id": "basu.input-buffer",
   "name": "Predictive Input Buffer",
   "developer": "BASU",
-  "description": "Clean gameplay build of the trajectory-based input buffer. No gameplay watermark, labels, console, hints, path drawings, or heatmap. Open the in-level menu with the configured menu key.",
+  "description": "Clean gameplay UI with resumable prediction searches, ordered deferred inputs, and detailed diagnostic logs.",
   "settings": {
     "custom-ticks": {
       "type": "int",
@@ -32,7 +32,7 @@
       "type": "float",
       "name": "Prediction time budget (ms)",
       "description": "Max time spent predicting per click. Higher = finds longer saves on big windows, but may hitch on dense levels.",
-      "default": 8.0,
+      "default": 10.0,
       "min": 1.0,
       "max": 30.0
     },
@@ -247,7 +247,7 @@
     "no-hitch-searches": {
       "type": "bool",
       "name": "No-hitch searches",
-      "description": "When a search runs out of time before it tried every delay, your click waits one tick and the search goes on from there with fresh time (up to 4 times), instead of giving up on the save. The delays it already tried all crashed, so waiting a tick loses nothing, and busy parts don't stutter from long searches. If it still finds no save, the click goes through then. A new input of yours meanwhile ends the search. Turn off if clicks in busy parts feel late.",
+      "description": "When a prediction exceeds its per-tick CPU budget, it yields and continues on later physics ticks until every remaining delay has been checked. New presses/releases are held in order while the search continues, so they do not cancel the pending click. If no timing is verified after the full search, the original input is delivered and the diagnostic log records why.",
       "default": true
     },
     "plan-next-click": {
@@ -277,8 +277,8 @@
     "explain-inputs": {
       "type": "bool",
       "name": "Explain every input (debug)",
-      "description": "Also store inputs passed straight to the game and why (safe input, spam guard, late-crash rule, or max delay 0) in the diagnostic log. Use Tools > Copy log to inspect it.",
-      "default": false
+      "description": "Store why each input was buffered, delayed, or passed through in the diagnostic log. Use Tools > Copy log to export it; nothing is drawn during gameplay.",
+      "default": true
     },
     "cbf-sync": {
       "type": "bool",
@@ -289,8 +289,8 @@
     "low-latency": {
       "type": "bool",
       "name": "Low latency mode",
-      "description": "For players who feel the buffer as lag or delayed clicks: clicks made while a delay is waiting are not shifted after it (no chain of delayed clicks), delays are at most 1 frame, searches are capped at 3 ms (no frame hitches), and robust saves / wave margin (which can add a tick) are off. On by default, and the same in every level.",
-      "default": true
+      "description": "Limits delay to 4 ticks (1 frame at 60 FPS) and prediction work to 3 ms. Keep OFF for reliable long-window buffering and resumable searches; ON intentionally trades prediction coverage for lower latency.",
+      "default": false
     },
     "ufo-smart": {
       "type": "bool",

@@ -1,4 +1,4 @@
-# Predictive Input Buffer — Clean UI
+# Predictive Input Buffer v2.99.6 — Clean UI
 
 A clean-interface fork of the supplied Predictive Input Buffer 2.99.5 source.
 
@@ -19,3 +19,10 @@ Build with the Geode SDK configured by the project. This source package has **no
 
 ## Attribution
 Modified from the original project: https://github.com/raresdalas1009/-predictive-input-buffer
+
+
+## Reliability / diagnostics fork
+
+This fork keeps prediction searches resumable across physics ticks, preserves later input events while a search is pending, and records input decisions, budget yields, resumes, and direct fallbacks in the in-memory diagnostic log. Use the in-level **Copy log** button (or the configured export key, F8 by default) after a test run and share `console-export.txt` when reporting an issue.
+
+The mod cannot guarantee that every click can be corrected: some inputs have no verified safe delay, and prediction is disabled for unsupported situations (for example, platformer mode or disabled buffering). In those cases it delivers the input and records the reason rather than silently dropping it. **Low latency** is off by default because it intentionally caps the delay window and CPU budget.

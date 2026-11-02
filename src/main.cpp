@@ -1,4 +1,4 @@
-// Predictive Input Buffer v2.99.5 (clean UI fork; gameplay overlays and consoles removed)
+// Predictive Input Buffer v2.99.6 (reliable search + deferred inputs + diagnostic log)
 //
 // When you click (or release, in wave / robot), a hidden "ghost" player is simulated
 // ahead with your input. If the ghost dies, the input is retried with 1..N ticks of
@@ -129,11 +129,17 @@ namespace {
     struct QueuedInput {
         int ticksLeft;
         bool down;
-        // v2.85 no-hitch: not an input yet, the search for it goes on when it comes due
+        // A resume entry is a pending decision, not an input to deliver yet.
         bool resume = false;
-        int from = 0;      // first delay (from then) not tried yet
-        int elapsed = 0;   // ticks since your click
+        int from = 0;       // first remaining delay to test from the current ghost state
+        int elapsed = 0;    // physics ticks since the original click
         int resumes = 0;
+        int originTick = -1; // original physics tick; used to keep later inputs ordered
+    };
+
+    struct DeferredInput {
+        int tick = 0;
+        bool down = false;
     };
 
     struct ObjSnapshot {
@@ -185,6 +191,14 @@ namespace {
         int ticksWave = 2;
 
         std::deque<QueuedInput> queue;
+        // Inputs arriving while a CPU-limited prediction is being resumed are held here.
+        // They are re-scheduled after the first input is resolved, preserving order/hold time.
+        std::deque<DeferredInput> deferredInputs;
+        uint64_t inputSequence = 0;
+        uint64_t budgetYields = 0;
+        uint64_t resumeCount = 0;
+        uint64_t deferredCount = 0;
+        uint64_t directFallbackCount = 0;
         int shift = 0;  // delay applied to inputs while the queue is active
 
         float tickLength = TICK;
@@ -407,7 +421,7 @@ namespace {
     // Formatting stays in memory only; gameplay does not render or print this log.
     // The full log is available through the menu's Copy log action, with the
     // physics step each line happened on.
-    constexpr size_t EXPORT_LINES = 400;
+    constexpr size_t EXPORT_LINES = 1600;
     std::deque<std::string> exportLines;
     int logClock = 0;  // physics steps since the level started, kept by the update hook
 
@@ -562,6 +576,7 @@ namespace {
 
     void resetPending() {
         buf.queue.clear();
+        buf.deferredInputs.clear();
         buf.shift = 0;
         buf.releaseShift = 0;
     }
@@ -757,8 +772,10 @@ namespace {
         }
         float dt = buf.tickLength > 0.001f ? buf.tickLength : TICK;
         text += fmt::format("{} | physics ~{:.0f} steps/s\n", stageText(), 60.f / dt);
-        text += fmt::format("budget {:g} ms | smart {} | full state {} | robust {} | late crash {} | practice only {}\n", buf.budgetMs,
-            buf.smart, buf.fullState, buf.robustSaves, buf.lateCrash, buf.practiceOnly);
+        text += fmt::format("budget {:g} ms (configured {:g}) | auto budget {} | no-hitch {} | low latency {} | smart {} | full state {} | robust {} | late crash {} | practice only {}\n", buf.budgetMs,
+            buf.userBudget, buf.autoBudget, buf.noHitch, buf.lowLatency, buf.smart, buf.fullState, buf.robustSaves, buf.lateCrash, buf.practiceOnly);
+        text += fmt::format("input diagnostics: sequence {} | budget yields {} | resumes {} | deferred inputs {} | direct fallbacks {} | pending {} / deferred {}\n",
+            buf.inputSequence, buf.budgetYields, buf.resumeCount, buf.deferredCount, buf.directFallbackCount, buf.queue.size(), buf.deferredInputs.size());
         text += fmt::format("orbs: align {} (ground {}, {}t) timing {} assume {} both {} | memory {} ({} spots)\n", buf.orbAlign,
             buf.orbAlignGround, buf.orbWindow, buf.orbTiming, buf.assumeOrbs, buf.tryBothOrbs, buf.learn, memorySpots());
         text += fmt::format("wave: v4.6 {} margin {} horizon {} spam gap {} | robot smart {} | spider smart {} | ship {} (max {}t)\n",
@@ -3107,7 +3124,9 @@ namespace {
     // set while a search is going on from a previous tick
     bool resumeNow = false;
     QueuedInput resumeEntry {};
-    constexpr int MAX_RESUMES = 4;
+    // Settings cap delay windows well below this. The old limit of four yielded searches
+    // forced a raw fallback on dense sections even though candidates were still untested.
+    constexpr int MAX_RESUMES = 256;
 
     // v2.7 wave scoring, the wave version of the cube's "landed safely". A wave never
     // lands, so a run that keeps going one way eventually hits a wall even in a normal
@@ -3158,16 +3177,14 @@ namespace {
     constexpr int ROBOT_HOLDS[] = { 4, 9, 14, 20, 27, 36, 48, 64 };
     int robotUsedHold = -1;   // hold length that made the last robot run survive
 
-    // v2.73: quick pass of a robot / UFO / spider search: only the plain run per delay (your
-    // usual robot hold, no extra flap / flip). Those modes tried up to 5x more runs per
-    // delay, so the search ran out of time after 2-10 delays and missed saves further out.
-    bool quickScore = false;
+    // Robot / UFO / spider searches always use their full scoring rules. The old approximate
+    // quick pass was removed so a partial pass cannot consume the budget before full scoring.
 
     int robotScore(PlayLayer* layer, PlayerObject* p1, PlayerObject* p2, bool dual, int delay, int horizon, int target, SimEnd* end) {
         int usual = robotHold.pick(st(20), 50);
         int best = simulateOrbs(layer, p1, p2, dual, delay, true, horizon, usual, target, end);
         robotUsedHold = usual;
-        if (best >= target || *end == SimEnd::StopSearch || quickScore) {
+        if (best >= target || *end == SimEnd::StopSearch) {
             return best;
         }
         int holds[std::size(ROBOT_HOLDS)];
@@ -3201,7 +3218,7 @@ namespace {
     int spiderScore(PlayLayer* layer, PlayerObject* p1, PlayerObject* p2, bool dual, int delay, int horizon, int releaseAfter, int target,
         SimEnd* end) {
         int ret = simulateOrbs(layer, p1, p2, dual, delay, true, horizon, releaseAfter, target, end);
-        if (ret >= target || *end == SimEnd::StopSearch || quickScore) {
+        if (ret >= target || *end == SimEnd::StopSearch) {
             return ret;
         }
         for (int margin : SPIDER_RETAP) {
@@ -3288,24 +3305,13 @@ namespace {
         return 0;
     }
 
-    // v2.73: quick pass over every delay first (half the budget), then the full scoring with
-    // whatever time is left.
+    // Full scoring is performed in one pass. The old quick-pass/full-pass split could spend
+    // half the click budget on approximate runs, then clear budgetCutK when no time remained
+    // for the real pass. That silently disabled no-hitch continuation and sent the click on.
+    // A single full-score pass can yield at an exact candidate and resume on the next physics tick.
     int searchTwoPass(int horizon, int maxDelay, int base, int* landed, std::function<int(int, int, SimEnd*)> const& score,
         bool needFull = false) {
-        quickScore = true;
-        int k = searchSmallest(horizon, maxDelay, base, landed, score, searchBudget() * 0.5, true, needFull);
-        quickScore = false;
-        if (k > 0) {
-            return k;
-        }
-        crashFixed = false;
-        double left = buf.budgetMs - clickMs();
-        if (left < 0.5) {
-            say("prediction budget hit (quick pass only)");
-            budgetCutK = 0;
-            return 0;
-        }
-        return searchSmallest(horizon, maxDelay, base, landed, score, left, false, needFull);
+        return searchSmallest(horizon, maxDelay, base, landed, score, searchBudget(), false, needFull);
     }
 
     // v2.25 ship scoring. Like the wave: a crash only counts if you couldn't have recovered.
@@ -3348,7 +3354,7 @@ namespace {
     int ufoScore(PlayLayer* layer, PlayerObject* p1, PlayerObject* p2, bool dual, int delay, int horizon, int releaseAfter, int target,
         SimEnd* end) {
         int ret = simulateOrbs(layer, p1, p2, dual, delay, true, horizon, releaseAfter, target, end);
-        if (ret >= target || *end == SimEnd::StopSearch || quickScore) {
+        if (ret >= target || *end == SimEnd::StopSearch) {
             return ret;
         }
         for (int margin : UFO_REFLAP) {
@@ -3492,7 +3498,7 @@ namespace {
             }
             if (overBudget()) {
                 say("prediction budget hit at +{} ticks", k);
-                budgetCutK = anyWave ? 0 : k;
+                budgetCutK = k;
                 break;
             }
         }
@@ -3537,6 +3543,30 @@ namespace {
 
     void queueInput(int ticks, bool down) {
         buf.queue.push_back({ ticks, down });
+    }
+
+    // Re-attach inputs that arrived while a no-hitch search was suspended. The original
+    // click is already at the front of buf.queue (when it was saved); every later input is
+    // shifted by the same amount, so press/release duration and order remain consistent.
+    void flushDeferredInputs(QueuedInput const& origin, int remainingDelay) {
+        if (buf.deferredInputs.empty()) {
+            return;
+        }
+        int previousOffset = 0;
+        size_t flushed = 0;
+        for (auto const& event : buf.deferredInputs) {
+            int offset = std::max(1, event.tick - (origin.originTick >= 0 ? origin.originTick : tickCount - origin.elapsed));
+            // Two changes captured in the same physics tick must still be delivered in order;
+            // a one-tick minimum avoids collapsing a press and its release into a zero-length tap.
+            offset = std::max(offset, previousOffset + 1);
+            queueInput(std::max(0, remainingDelay) + offset, event.down);
+            previousOffset = offset;
+            ++flushed;
+        }
+        say("INPUT QUEUE: restored {} deferred event(s), first offset +{}t, base delay {}t", flushed,
+            flushed ? std::max(1, buf.deferredInputs.front().tick - (origin.originTick >= 0 ? origin.originTick : tickCount - origin.elapsed)) : 0,
+            remainingDelay);
+        buf.deferredInputs.clear();
     }
 
     // v2.51 practice stats: every save (or, in training, every input that would have been
@@ -3961,10 +3991,19 @@ namespace {
         if (!layer) {
             return false;
         }
-        // v2.85 no-hitch: a search going on from an earlier tick starts after the delays it
-        // already tried. A new input of yours meanwhile ends it: the waiting click becomes a
-        // plain delayed click, and this input follows it as usual.
+        // A pending no-hitch search must not be cancelled by the next physical input.
+        // Keep subsequent events separately; resume the original prediction first, then
+        // re-attach these events with the same timing shift so a press/release is not swallowed.
         bool resuming = resumeNow;
+        if (!resuming && !buf.queue.empty() && buf.queue.front().resume) {
+            buf.isPlayer1 = isPlayer1;
+            buf.realInput = down;
+            buf.deferredInputs.push_back({ tickCount, down });
+            ++buf.deferredCount;
+            say("INPUT DEFERRED #{}: {} while search pending ({} queued event(s))", ++buf.inputSequence,
+                down ? "press" : "release", buf.deferredInputs.size());
+            return true;
+        }
         searchFrom = resuming ? std::max(1, resumeEntry.from) : 1;
         budgetCutK = 0;
         struct SearchFromReset {
@@ -3973,9 +4012,11 @@ namespace {
             }
         } searchFromReset;
         if (!resuming) {
-            for (auto& q : buf.queue) {
-                q.resume = false;
-            }
+            ++buf.inputSequence;
+            say("INPUT #{}: {} | tick {} | queue {} | mode {}", buf.inputSequence, down ? "press" : "release", tickCount,
+                buf.queue.size(), self->m_player1 ? (self->m_player1->m_isDart ? "wave" : self->m_player1->m_isShip ? "ship" :
+                self->m_player1->m_isBird ? "ufo" : self->m_player1->m_isBall ? "ball" : self->m_player1->m_isRobot ? "robot" :
+                self->m_player1->m_isSpider ? "spider" : self->m_player1->m_isSwing ? "swing" : "cube") : "unknown");
         }
         // v2.80: the mod already clicked for you here; your own late click (press and its
         // release) is swallowed so it doesn't jump a second time
@@ -3992,6 +4033,7 @@ namespace {
         // v2.55: a P2-side input in a two-player level only steers Player 2 while dual mode is
         // on; before that it moves Player 1 (Relief's wave parts), so it's buffered like a P1 input.
         if (twoPlayer && !isPlayer1 && layer->m_gameState.m_isDualMode) {
+            say("DIRECT INPUT: P2 input in a two-player dual section is not simulated by the P1 buffer");
             return false;
         }
         // In two-player levels P2 is someone else: never simulate P1's input on it.
@@ -4010,15 +4052,18 @@ namespace {
             }
         }
         if (!buf.enabled) {
+            say("DIRECT INPUT: buffer is OFF");
             buf.appliedInput = down;
             return false;
         }
         if (buf.practiceOnly && !layer->m_isPracticeMode) {
+            say("DIRECT INPUT: Practice-only is enabled and this is a normal run");
             buf.appliedInput = down;
             return false;
         }
         // v2.4: the ghost never presses left/right, so platformer predictions are meaningless.
         if (layer->m_isPlatformer) {
+            say("DIRECT INPUT: platformer mode is not supported by trajectory prediction");
             buf.appliedInput = down;
             return false;
         }
@@ -4045,6 +4090,7 @@ namespace {
 
         bool anyShip = p1 && (p1->m_isShip || (p2 && p2->m_isShip));
         if (!p1 || p1->m_isDead || (anyShip && !buf.shipBuffer)) {
+            say("DIRECT INPUT: {}", !p1 ? "player pointer unavailable" : p1->m_isDead ? "player is dead" : "ship buffering is disabled");
             resetPending();
             buf.appliedInput = down;
             return false;
@@ -4080,9 +4126,7 @@ namespace {
         bool anySwing = p1->m_isSwing || (p2 && p2->m_isSwing);
         if ((anyWave || anyShip || (anyUfo && buf.ufoSmart) || (anyBall && buf.ballSmart) || (anySwing && buf.swingSmart)) &&
             buf.rapid >= buf.spamStreak) {
-            if (buf.explain) {
-                say("pass {}: spam ({} fast inputs in a row, gap < {}t)", down ? "press" : "release", buf.rapid, spamGap);
-            }
+            say("DIRECT INPUT: spam guard ({} fast inputs in a row, gap < {}t)", buf.rapid, spamGap);
             // v2.47: path view marks inputs that skipped prediction (gray dot on you), so a
             // missing path isn't mistaken for a broken mod
             if (buf.showPath && buf.pathNode) {
@@ -4171,9 +4215,7 @@ namespace {
             }
         }
         if (maxDelay <= 0) {
-            if (buf.explain) {
-                say("pass {}: max delay is 0 for this mode", down ? "press" : "release");
-            }
+            say("DIRECT INPUT: max delay is 0 (low latency {}, per-mode {}, stage {})", buf.lowLatency, buf.perMode, buf.stage);
             buf.appliedInput = down;
             return false;
         }
@@ -4342,14 +4384,11 @@ namespace {
                     return true;
                 }
             }
-            if (buf.explain) {
-                if (buf.baseEscape >= 0) {
-                    say("pass {}{}: safe only if you react by t{} (else crash at t{})", down ? "press" : "release", tickTag,
-                        buf.baseEscape, buf.baseCrash);
-                }
-                else {
-                    say("pass {}{}: safe now (survives the {}t look-ahead)", down ? "press" : "release", tickTag, horizon);
-                }
+            if (buf.baseEscape >= 0) {
+                say("DIRECT INPUT: safe with normal timing only if you react by t{} (otherwise crash at t{})", buf.baseEscape, buf.baseCrash);
+            }
+            else {
+                say("DIRECT INPUT: prediction says this timing is already safe for the {}t look-ahead", horizon);
             }
             // v2.82: a robot press that's only safe with a hold unlike your usual one
             if (robotPress && baseHold > 0) {
@@ -4386,7 +4425,7 @@ namespace {
         // trusted here. Leave the input alone.
         int slice = sliceOf(p1);
         if (memorySaysSkip(slice)) {
-            say("memory: saves here failed before, input left alone");
+            say("DIRECT INPUT: level memory blacklisted buffering at this spot after failed saves");
             decided(layer, p1, p2, dual, 0, down, horizon, releaseAfter);
             pending.skipped = true;
             buf.appliedInput = down;
@@ -4450,20 +4489,31 @@ namespace {
         // one tick and the search goes on from there with fresh time (the delays it already
         // tried all crashed, so waiting a tick loses nothing), instead of giving up.
         int resumes = resuming ? resumeEntry.resumes : 0;
-        if (saved <= 0 && buf.noHitch && budgetCutK > 0 && budgetCutK < maxDelay && resumes < MAX_RESUMES &&
-            !(anyWave && buf.waveV46)) {
+        if (saved <= 0 && buf.noHitch && budgetCutK > 0 && budgetCutK < maxDelay && resumes < MAX_RESUMES) {
             QueuedInput next { std::max(0, 1 - early), down, true, budgetCutK, (resuming ? resumeEntry.elapsed : 0) + 1, resumes + 1 };
-            if (buf.explain) {
-                say("search goes on next tick (tried up to +{}t of {}t)", budgetCutK + (resuming ? resumeEntry.elapsed : 0),
-                    maxDelay + (resuming ? resumeEntry.elapsed : 0));
-            }
+            next.originTick = resuming && resumeEntry.originTick >= 0 ? resumeEntry.originTick : tickCount;
+            ++buf.budgetYields;
+            say("BUDGET YIELD: {} {} | tried through +{}t / {}t | next from +{}t | {:.2f} ms / {:.2f} ms | resume {}",
+                down ? "press" : "release", anyWave ? "wave" : "non-wave",
+                budgetCutK + (resuming ? resumeEntry.elapsed : 0), maxDelay + (resuming ? resumeEntry.elapsed : 0), budgetCutK,
+                clickMs(), buf.budgetMs, next.resumes);
             buf.shift = 1;
             buf.queue.push_back(next);
             return true;
         }
         if (saved <= 0) {
-            say("no save: {}{} dies in {}t (max {}t, best +{}t -> {}t of {}){}", down ? "press" : "release", tickTag, base, maxDelay,
-                dbgBestK, dbgBestRet, horizon, !crashFixed ? "" : base < st(30) ? " - too late: waiting only makes it crash sooner" : " - same crash at any timing (next obstacle)");
+            bool exhaustedResumeLimit = resuming && resumes >= MAX_RESUMES;
+            if (budgetCutK > 0 || clickMs() > buf.budgetMs) {
+                say("DIRECT FALLBACK: {} because search could not continue (cut at +{}t, elapsed {:.2f} ms, budget {:.2f} ms, resume {} / {})",
+                    down ? "press" : "release", budgetCutK, clickMs(), buf.budgetMs, resumes, MAX_RESUMES);
+                ++buf.directFallbackCount;
+            }
+            else {
+                say("DIRECT INPUT: no verified save for {} | dies in {}t | max delay {}t | best +{}t -> {}t of {}{}",
+                    down ? "press" : "release", base, maxDelay, dbgBestK, dbgBestRet, horizon,
+                    exhaustedResumeLimit ? " | resume limit reached" : "",
+                    !crashFixed ? "" : base < st(30) ? " - too late: waiting only makes it crash sooner" : " - same crash at any timing (next obstacle)");
+            }
             decided(layer, p1, p2, dual, 0, down, horizon, releaseAfter);
             buf.appliedInput = down;
             return false;
@@ -4514,7 +4564,7 @@ namespace {
             buf.trackMovers = false;
         }
         if (buf.avoidMovers && buf.sawMover) {
-            say("skip +{}t save: moving objects ahead", saved);
+            say("DIRECT INPUT: rejected +{}t save because moving objects are ahead and are not safely predictable", saved);
             decided(layer, p1, p2, dual, 0, down, horizon, releaseAfter);
             buf.appliedInput = down;
             return false;
@@ -4682,12 +4732,28 @@ namespace {
     void resumeClick(PlayLayer* layer, QueuedInput const& q) {
         resumeNow = true;
         resumeEntry = q;
+        ++buf.resumeCount;
+        say("RESUME #{}: {} | elapsed {}t | search from +{}t | pending follow-ups {}", q.resumes,
+            q.down ? "press" : "release", q.elapsed, q.from, buf.deferredInputs.size());
         bool held = intercept(layer, q.down, buf.isPlayer1);
         resumeNow = false;
         sweepGhostLayer();
         if (!held) {
             sendButton(layer, q.down);
+            buf.shift = q.elapsed;
+            flushDeferredInputs(q, 0);
+            say("RESUME COMPLETE: original {} delivered without a verified delay; follow-ups preserved", q.down ? "press" : "release");
+            return;
         }
+        // A resume entry at the back means the search yielded again. Do not release the
+        // deferred events yet; they must remain behind the original click's eventual result.
+        if (!buf.queue.empty() && buf.queue.back().resume) {
+            return;
+        }
+        int chosenRemainingDelay = buf.queue.empty() ? 0 : std::max(0, buf.queue.back().ticksLeft);
+        buf.shift = q.elapsed + chosenRemainingDelay;
+        flushDeferredInputs(q, chosenRemainingDelay);
+        say("RESUME COMPLETE: original {} scheduled in {}t", q.down ? "press" : "release", chosenRemainingDelay);
     }
 
     void deliverPending(PlayLayer* layer, PlayerObject* player) {
@@ -4799,6 +4865,7 @@ class BufferMenu : public geode::Popup {
     };
     static constexpr Option TOOLS[] = {
         { "save-ding", "Sound on successful save" },
+        { "explain-inputs", "Detailed input logs" },
         { "performance-mode", "Performance mode" },
     };
     static constexpr char const* TABS[] = { "Buffer", "Prediction", "Modes", "Custom", "Tools" };
@@ -5739,11 +5806,12 @@ $on_mod(Loaded) {
     buf.console = false; // clean UI build: never open a separate live console window
     buf.showPath = false; // path rendering is intentionally unavailable in this clean UI build
     recoverGlobals();
-    // v2.58: low latency is switched on for everyone once (it can still be turned off), and
-    // the stage you picked last comes back, the same in every level.
-    if (!Mod::get()->getSavedValue<bool>("low-latency-v258", false)) {
-        Mod::get()->setSettingValue<bool>("low-latency", true);
-        Mod::get()->setSavedValue("low-latency-v258", true);
+    // Reliability fork migration: disable the old low-latency default once. That preset
+    // capped delay at 4 ticks and prediction at 3 ms, defeating long-window recovery.
+    if (!Mod::get()->getSavedValue<bool>("reliable-buffer-v2996", false)) {
+        Mod::get()->setSettingValue<bool>("low-latency", false);
+        Mod::get()->setSettingValue<bool>("no-hitch-searches", true);
+        Mod::get()->setSavedValue("reliable-buffer-v2996", true);
     }
     buf.stage = std::clamp(Mod::get()->getSavedValue<int>("stage", buf.stage), 0, STAGE_COUNT - 1);
     // v2.62: per-level settings off (switched off once): every level uses the same switches
@@ -5762,7 +5830,7 @@ $on_mod(Loaded) {
     if (Loader::get()->isModLoaded("square3ang.cbfextrapolate")) {
         say("CBF Extrapolate detected: visual only, predictions unaffected");
     }
-    say("v2.99.5 loaded. Stage key cycles: 0.5f -> 1f -> 2f -> 4f -> 6f -> 8f -> custom -> off");
+    say("v2.99.6 reliable-buffer build loaded. Searches resume across ticks; diagnostics are enabled");
 }
 
 class $modify(BufPlayLayer, PlayLayer) {
@@ -5831,6 +5899,11 @@ class $modify(BufPlayLayer, PlayLayer) {
         applyStage();
         exportLines.clear();
         logClock = 0;
+        buf.inputSequence = 0;
+        buf.budgetYields = 0;
+        buf.resumeCount = 0;
+        buf.deferredCount = 0;
+        buf.directFallbackCount = 0;
         loadMemory(level);
         if (statsKey != memoryKey) {
             statsKey = memoryKey;
