@@ -6,11 +6,11 @@
     "mac": "2.2081",
     "ios": "2.2081"
   },
-  "version": "v2.99.7",
+  "version": "3.0.1",
   "id": "basu.input-buffer",
   "name": "Predictive Input Buffer",
   "developer": "BASU",
-  "description": "Expanded 32-frame custom buffer windows, opt-in wave spam bypass and failed-spot blacklist, adaptive prediction budget, and diagnostic logging.",
+  "description": "Native Geometry Dash 2.2 physics clock, render-FPS-independent input prediction, expanded robust wave lookahead and detailed diagnostics.",
   "settings": {
     "custom-ticks": {
       "type": "int",
@@ -23,16 +23,16 @@
     "custom-wave-ticks": {
       "type": "int",
       "name": "Custom stage: max wave delay (ticks)",
-      "description": "Max delay for the CUSTOM stage (key 6) while in wave. 128 = 32 frames; max 256 = 64 frames.",
-      "default": 128,
+      "description": "Max delay for the CUSTOM stage (key 6) while in wave. 128 = 32 frames; 256 = 64 frames. Larger windows can take longer to search and may defer later inputs.",
+      "default": 256,
       "min": 0,
       "max": 256
     },
     "sim-budget-ms": {
       "type": "float",
       "name": "Prediction time budget (ms)",
-      "description": "Max time spent predicting per click. Higher = finds longer saves on big windows, but may hitch on dense levels.",
-      "default": 10.0,
+      "description": "Total configured prediction work budget. With No-hitch enabled, work is divided into 1 ms slices and resumed on later native physics updates. The budget is not scaled by render FPS.",
+      "default": 16.0,
       "min": 1.0,
       "max": 30.0
     },
@@ -59,10 +59,10 @@
     "wave-horizon": {
       "type": "int",
       "name": "Wave lookahead (ticks)",
-      "description": "How far ahead the wave prediction looks (mini wave uses 15 ticks less). 65 = 65 normal / 50 mini. Longer sees crashes further away but costs more time per click.",
-      "default": 65,
+      "description": "Wave full-simulation look-ahead in native 240-Hz physics ticks. 240 ticks = 1 second. More look-ahead can detect tight-gap sequences but costs more CPU and may defer later inputs while a search completes.",
+      "default": 240,
       "min": 20,
-      "max": 160
+      "max": 240
     },
     "orb-assume-hit": {
       "type": "bool",
@@ -351,8 +351,8 @@
     "auto-budget": {
       "type": "bool",
       "name": "Auto time budget",
-      "description": "While the game is already dropping frames (a frame took over twice as long as it should, and over 20 ms), clicks get at most 4 ms of prediction time so it doesn't get worse. Otherwise the time budget setting is used as it is.",
-      "default": true
+      "description": "Deprecated in v3.0.0. Prediction scheduling is fixed per physics tick and no longer scales with render-frame interval.",
+      "default": false
     },
     "check-updates": {
       "type": "bool",
@@ -411,18 +411,15 @@
     },
     "tps": {
       "type": "int",
-      "name": "Physics TPS",
-      "description": "Physics steps per second in levels. 240 is the normal game. Higher values change the physics, so runs at anything but 240 aren't legit completions. The buffer's windows scale with it automatically.",
+      "name": "Physics clock (native)",
+      "description": "Fixed to Geometry Dash 2.2 native 240 TPS. This mod does not override gameplay physics or couple physics rate to render FPS. Do not raise this value.",
       "default": 240,
       "min": 240,
-      "max": 1000,
+      "max": 240,
       "control": {
-        "slider": true,
-        "slider-step": 10,
-        "input": true,
-        "arrows": true,
-        "arrow-step": 10,
-        "big-arrows": false
+        "slider": false,
+        "input": false,
+        "arrows": false
       }
     },
     "skip-failed-spots": {

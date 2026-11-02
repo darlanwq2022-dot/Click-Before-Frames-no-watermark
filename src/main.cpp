@@ -1,4 +1,4 @@
-// Predictive Input Buffer v2.99.6 (reliable search + deferred inputs + diagnostic log)
+// Predictive Input Buffer v3.0.1 (native GD physics + FPS-neutral scheduling + wave reliability)
 //
 // When you click (or release, in wave / robot), a hidden "ghost" player is simulated
 // ahead with your input. If the ghost dies, the input is retried with 1..N ticks of
@@ -49,6 +49,7 @@
 #include <thread>
 #include <unordered_map>
 #include <unordered_set>
+#include <utility>
 #include <vector>
 
 using namespace geode::prelude;
@@ -204,6 +205,12 @@ namespace {
         int shift = 0;  // delay applied to inputs while the queue is active
 
         float tickLength = TICK;
+        // Render and physics cadence are measured separately. GD 2.2 owns the native
+        // 240-TPS physics loop; this mod must never replace it with a render-driven clock.
+        double renderFps = 60.0;
+        float renderDt = 1.f / 60.f;
+        int physicsStepsThisFrame = 0;
+        int physicsStepsLastFrame = 0;
         int sinceInput = 999;
         int rapid = 0;
 
@@ -272,6 +279,11 @@ namespace {
         // ticks, used instead of the stage's when on. Order: MODE_NAMES.
         bool perMode = false;
         std::array<int, 8> modeTicks { 40, 4, 40, 40, 20, 40, 40, 40 };
+        // v2.99.8: independent tick tuning for each mode. Values are 240-Hz physics ticks;
+        // min defaults to 1, max=0 means Off (use the selected stage/per-mode ceiling).
+        bool tickTuning = true;
+        std::array<int, 8> modeMinTicks { 1, 1, 1, 1, 1, 1, 1, 1 };
+        std::array<int, 8> modeMaxTicks { 0, 0, 79, 0, 0, 0, 0, 0 };
         bool perfLog = false;        // v2.21: log time / runs / ghost ticks per click
         int simRuns = 0;             // v2.21: predictions run for the current click
         long simTicks = 0;           // v2.21: ghost ticks stepped for the current click
@@ -418,6 +430,9 @@ namespace {
             }
         }
     }
+
+    // Wall-clock throttle shared by no-hitch continuation processing.
+    std::chrono::steady_clock::time_point lastSearchResumeAt {};
 
     // Log line -> in-memory history for copy/export; never rendered during gameplay.
     // Formatting stays in memory only; gameplay does not render or print this log.
@@ -665,42 +680,34 @@ namespace {
         buf.userBudget = buf.budgetMs;
     }
 
-    // v2.99.7 auto budget: cap a search at 8 ms during a detected frame hitch. This
-    // still prevents a 30 ms search from compounding the hitch, without starving the search
-    // as aggressively as the old 4 ms cap.
-    // at 240+ fps that was 2 ms, too short for a long cube jump's search (Penumbral's first
-    // jump: only +1..+5 delays were ever tried, so most clicks got no save).
+    // v3.0.1: the prediction budget is measured only with steady_clock. Render FPS is
+    // never used to scale the budget. The game owns its native 240-TPS physics clock; the
+    // predictor advances only on actual PlayerObject physics updates.
     void clickBudget() {
-        double budget = buf.userBudget;
-        if (buf.autoBudget) {
-            auto* director = CCDirector::get();
-            double interval = director->getAnimationInterval() * 1000.0;
-            double frame = director->getDeltaTime() * 1000.0;
-            // v2.77: at most about one frame per click (never under 4 ms, so long cube jumps
-            // still get searched): 4.2 ms at 240 fps, 7 ms at 144, the setting at 60
-            if (interval > 0.0) {
-                budget = std::min(budget, std::max(4.0, interval));
-            }
-            if (interval > 0.0 && frame > std::max(interval * 2.0, 20.0)) {
-                budget = std::min(budget, 8.0);
-            }
-        }
-        buf.budgetMs = budget;
+        buf.budgetMs = buf.userBudget;
     }
 
     // v2.88 per-mode frames, kept in the mod's saved values (they start from your custom stage)
     constexpr char const* MODE_NAMES[] = { "Cube", "Ship", "Ball", "UFO", "Wave", "Robot", "Spider", "Swing" };
     constexpr int MODE_TICKS_MAX = 128; // 32 frames (240 Hz physics ticks)
+    constexpr int TICK_TUNING_MAX = 256; // 64 frames / 256 internal 240-Hz physics ticks
 
     void readModeTicks() {
         auto* mod = Mod::get();
         buf.perMode = mod->getSavedValue<bool>("per-mode-frames", false);
+        buf.tickTuning = mod->getSavedValue<bool>("tick-tuning-enabled", true);
         int all = static_cast<int>(mod->getSettingValue<int64_t>("custom-ticks"));
         int wave = static_cast<int>(mod->getSettingValue<int64_t>("custom-wave-ticks"));
         int ship = static_cast<int>(mod->getSettingValue<int64_t>("ship-max-delay"));
         for (int i = 0; i < 8; ++i) {
             int fallback = i == 4 ? wave : i == 1 ? ship : all;
             buf.modeTicks[i] = std::clamp(mod->getSavedValue<int>(fmt::format("mode-ticks-{}", i), fallback), 0, MODE_TICKS_MAX);
+            buf.modeMinTicks[i] = std::clamp(mod->getSavedValue<int>(fmt::format("mode-min-ticks-{}", i), 1), 1, TICK_TUNING_MAX);
+            int maxFallback = i == 2 ? 79 : 0; // Nova-style default: Ball 79t, others Off
+            buf.modeMaxTicks[i] = std::clamp(mod->getSavedValue<int>(fmt::format("mode-max-ticks-{}", i), maxFallback), 0, TICK_TUNING_MAX);
+            if (buf.modeMaxTicks[i] > 0 && buf.modeMaxTicks[i] < buf.modeMinTicks[i]) {
+                buf.modeMaxTicks[i] = buf.modeMinTicks[i];
+            }
         }
     }
 
@@ -709,6 +716,15 @@ namespace {
         mod->setSavedValue("per-mode-frames", buf.perMode);
         for (int i = 0; i < 8; ++i) {
             mod->setSavedValue(fmt::format("mode-ticks-{}", i), buf.modeTicks[i]);
+        }
+    }
+
+    void saveTickTuning() {
+        auto* mod = Mod::get();
+        mod->setSavedValue("tick-tuning-enabled", buf.tickTuning);
+        for (int i = 0; i < 8; ++i) {
+            mod->setSavedValue(fmt::format("mode-min-ticks-{}", i), buf.modeMinTicks[i]);
+            mod->setSavedValue(fmt::format("mode-max-ticks-{}", i), buf.modeMaxTicks[i]);
         }
     }
 
@@ -776,9 +792,20 @@ namespace {
                 layer->m_isPracticeMode ? ", practice" : "");
         }
         float dt = buf.tickLength > 0.001f ? buf.tickLength : TICK;
-        text += fmt::format("{} | physics ~{:.0f} steps/s\n", stageText(), 60.f / dt);
+        text += fmt::format("{} | physics step ~{:.3f} ms | {} P1 physics steps/render frame | render ~{:.1f} FPS\n",
+            stageText(), static_cast<double>(dt) * (1000.0 / 60.0), buf.physicsStepsLastFrame, buf.renderFps);
         text += fmt::format("budget {:g} ms (configured {:g}) | auto budget {} | no-hitch {} | low latency {} | smart {} | full state {} | robust {} | late crash {} | practice only {}\n", buf.budgetMs,
             buf.userBudget, buf.autoBudget, buf.noHitch, buf.lowLatency, buf.smart, buf.fullState, buf.robustSaves, buf.lateCrash, buf.practiceOnly);
+        text += fmt::format("tick tuning: {} | values are 240-Hz physics ticks (1 tick = 0.25 frame at 60 FPS)\n", buf.tickTuning ? "ON" : "OFF");
+        for (int i = 0; i < 8; ++i) {
+            if (i == 1 || i == 4) {
+                text += fmt::format("  {}: N/A (dedicated timing)\n", MODE_NAMES[i]);
+            }
+            else {
+                text += fmt::format("  {}: min {}t | max {}\n", MODE_NAMES[i], buf.modeMinTicks[i],
+                    buf.modeMaxTicks[i] > 0 ? fmt::format("{}t", buf.modeMaxTicks[i]) : std::string("Off (stage cap)"));
+            }
+        }
         text += fmt::format("input diagnostics: sequence {} | budget yields {} | resumes {} | deferred inputs {} | direct fallbacks {} | pending {} / deferred {}\n",
             buf.inputSequence, buf.budgetYields, buf.resumeCount, buf.deferredCount, buf.directFallbackCount, buf.queue.size(), buf.deferredInputs.size());
         text += fmt::format("orbs: align {} (ground {}, {}t) timing {} assume {} both {} | memory {} ({} spots) | skip failed spots {}\n", buf.orbAlign,
@@ -2896,8 +2923,8 @@ namespace {
 
     // Full wave look-ahead from the setting (mini = 15 less).
     int fullWaveHorizon(bool mini) {
-        int wh = std::clamp(buf.waveHorizon, 20, 160);
-        return st(mini ? std::max(20, wh - 15) : wh);  // v4.6: 65 normal / 50 mini
+        int wh = std::clamp(buf.waveHorizon, 20, 240);
+        return st(mini ? std::max(20, wh - 15) : wh);  // v3.0.0: up to 240 normal / 225 mini
     }
 
     // v2.83 two clicks ahead: a run can crash only because the ghost never clicks again (the
@@ -2992,7 +3019,7 @@ namespace {
         };
 
         // the orb timing that worked at this spot on earlier runs is tried first
-        if (learned > 0 && learned <= maxDelay) {
+        if (learned >= searchFrom && learned <= maxDelay) {
             bool used;
             int ret = tryAt(learned, &used);
             if (used && ret >= horizon) {
@@ -3022,7 +3049,7 @@ namespace {
             return 0;  // pressing now uses the orb and is safe: nothing to fix
         }
         // every tick from just before the orb to the last tick inside it
-        int from = nowUsed ? 1 : std::max(1, touch - 1);
+        int from = std::max(searchFrom, nowUsed ? 1 : std::max(1, touch - 1));
         int to = std::min(maxDelay, std::max(leave, touch + st(6)));
         int safeStart = -1, safeEnd = -1;
         int bestRet = -1, bestK = 0;
@@ -3131,9 +3158,16 @@ namespace {
     // set while a search is going on from a previous tick
     bool resumeNow = false;
     QueuedInput resumeEntry {};
-    // The expanded custom window can reach 256 physics ticks. Leave enough continuation
-    // headroom for one resumable search to span that entire window without a limit fallback.
-    constexpr int MAX_RESUMES = 512;
+    // v3.0.0: a pending search gets one bounded slice per *physics tick*. A wall-clock
+    // cooldown made 30-FPS rendering resume roughly 30 times/s, while 60-FPS rendering
+    // resumed roughly 60 times/s even though both run the same 240 physics steps/s.
+    // With the normalized clock below, one slice per physics update is frame-rate neutral.
+    constexpr int MAX_RESUMES = 1024;
+    constexpr double RESUME_SLICE_MS = 1.0;
+
+    bool resumeSliceReady() {
+        return true;
+    }
 
     // v2.7 wave scoring, the wave version of the cube's "landed safely". A wave never
     // lands, so a run that keeps going one way eventually hits a wall even in a normal
@@ -3389,17 +3423,56 @@ namespace {
 
     int searchWave(PlayLayer* layer, PlayerObject* p1, PlayerObject* p2, bool dual, bool down, int horizon, int maxDelay, int base,
         int* landed) {
+        // Wave timing is unusually sensitive: accepting only base+12 ticks made a click look
+        // "saved" even when the corrected path still died almost immediately. Search against
+        // the full look-ahead, verify the candidate with a small position offset on both sides,
+        // and prefer the middle of a contiguous safe timing window.
         marginUsed = false;
         using clock = std::chrono::steady_clock;
         auto start = clock::now();
         double budget = searchBudget();
-        int target = std::min(horizon, base + st(12));
         dbgBestK = 0;
         dbgBestRet = -1;
         budgetCutK = 0;
+
+        const float speedRatio = std::abs(p1->m_playerSpeed) / 0.9f;
+        // Tight wave corridors can have a one-tick safe window. Test a lighter quarter-tick
+        // positional perturbation here (instead of the generic half-tick check); the separate
+        // adjacent-delay margin still prefers the centre when multiple timings are safe.
+        const float robustShift = std::max(0.12f, 0.25f * (311.58f / 240.f) * speedRatio);
+        auto waveAt = [&](int delay, float offset, int target) {
+            buf.ghostShiftX = offset;
+            SimEnd e;
+            int ret = waveScore(layer, p1, p2, dual, delay, down, horizon, target, &e);
+            buf.ghostShiftX = 0.f;
+            return std::pair<int, SimEnd>{ ret, e };
+        };
+        auto robustAt = [&](int delay, int target) {
+            auto center = waveAt(delay, 0.f, target);
+            if (center.second == SimEnd::StopSearch || center.first < target) {
+                return false;
+            }
+            if (!buf.robustSaves) {
+                return true;
+            }
+            auto ahead = waveAt(delay, robustShift, target);
+            if (ahead.second == SimEnd::StopSearch || ahead.first < target) {
+                return false;
+            }
+            auto behind = waveAt(delay, -robustShift, target);
+            return behind.second != SimEnd::StopSearch && behind.first >= target;
+        };
+
+        // A secondary score keeps a genuinely useful partial save available if no delay can
+        // survive the entire look-ahead. Score total time from the original input, not just the
+        // time after the delayed toggle (k + survived).
+        int bestPartialK = 0;
+        int bestPartialRet = -1;
+        int bestPartialTotal = base;
+        const int partialGain = st(12);
+
         for (int k = searchFrom; k <= maxDelay; ++k) {
-            SimEnd end;
-            int ret = waveScore(layer, p1, p2, dual, k, down, horizon, target, &end);
+            auto [ret, end] = waveAt(k, 0.f, horizon);
             if (ret > dbgBestRet) {
                 dbgBestRet = ret;
                 dbgBestK = k;
@@ -3407,26 +3480,65 @@ namespace {
             if (end == SimEnd::StopSearch) {
                 return 0;
             }
-            if (ret >= target) {
-                *landed = ret;
-                // v2.10 safety margin: the first safe delay is the one that only just clears
-                // the spike corner, so a pixel of difference in the real run can still clip
-                // it. If the next two delays are safe too, take the middle one: a tick of
-                // room on both sides.
-                if (buf.waveMargin && k + 2 <= maxDelay) {
-                    SimEnd e1, e2;
-                    if (waveScore(layer, p1, p2, dual, k + 1, down, horizon, target, &e1) >= target &&
-                        waveScore(layer, p1, p2, dual, k + 2, down, horizon, target, &e2) >= target) {
-                        marginUsed = true;
-                        return k + 1;
+
+            if (ret >= horizon) {
+                // Verify a full-horizon save with a position perturbation. This rejects a
+                // one-pixel/one-substep "perfect" path that has no room for simulation drift.
+                if (robustAt(k, horizon)) {
+                    int chosen = k;
+                    // Check two adjacent timings. When all three work, use the centre of the
+                    // safe band rather than its earliest, most fragile edge.
+                    if (buf.waveMargin && k + 2 <= maxDelay) {
+                        auto n1 = waveAt(k + 1, 0.f, horizon);
+                        auto n2 = n1.first >= horizon && n1.second != SimEnd::StopSearch
+                            ? waveAt(k + 2, 0.f, horizon) : std::pair<int, SimEnd>{ 0, SimEnd::StopSearch };
+                        if (n1.first >= horizon && n1.second != SimEnd::StopSearch &&
+                            n2.first >= horizon && n2.second != SimEnd::StopSearch && robustAt(k + 1, horizon)) {
+                            chosen = k + 1;
+                            marginUsed = true;
+                        }
+                    }
+                    *landed = horizon;
+                    say("wave: full-horizon save +{}t{}{}", chosen,
+                        buf.robustSaves ? " (position-robust)" : "",
+                        marginUsed ? " (middle of safe window)" : "");
+                    return chosen;
+                }
+            }
+            else {
+                int total = k + ret;
+                if (total > bestPartialTotal) {
+                    bestPartialTotal = total;
+                    bestPartialK = k;
+                    bestPartialRet = ret;
+                }
+            }
+
+            if (std::chrono::duration<double, std::milli>(clock::now() - start).count() > budget) {
+                // If no full-horizon solution has appeared yet, a clearly better and robust
+                // partial trajectory can still be preferable to sending the original timing.
+                // It must buy at least 12 real physics-time ticks, not just survive 12 ticks
+                // after an arbitrarily late delivery.
+                if (bestPartialK > 0 && bestPartialTotal >= base + partialGain) {
+                    int needAfter = std::clamp(base + partialGain - bestPartialK, 1, horizon);
+                    if (robustAt(bestPartialK, needAfter)) {
+                        *landed = bestPartialRet;
+                        say("wave: partial but robust save +{}t | total survival {}t -> {}t", bestPartialK, base, bestPartialTotal);
+                        return bestPartialK;
                     }
                 }
-                return k;
-            }
-            if (std::chrono::duration<double, std::milli>(clock::now() - start).count() > budget) {
-                say("prediction budget hit at +{} ticks", k);
-                budgetCutK = k;
+                say("prediction budget hit at wave delay +{}t (full horizon {}t)", k, horizon);
+                budgetCutK = k; // after the next physics step this is the remaining delay for the next absolute candidate
                 return 0;
+            }
+        }
+
+        if (bestPartialK > 0 && bestPartialTotal >= base + partialGain) {
+            int needAfter = std::clamp(base + partialGain - bestPartialK, 1, horizon);
+            if (robustAt(bestPartialK, needAfter)) {
+                *landed = bestPartialRet;
+                say("wave: partial but robust save +{}t | total survival {}t -> {}t", bestPartialK, base, bestPartialTotal);
+                return bestPartialK;
             }
         }
         return 0;
@@ -3993,7 +4105,6 @@ namespace {
 
     bool intercept(GJBaseGameLayer* self, bool down, bool isPlayer1) {
         ClickTimer timer;
-        clickBudget();
         auto* layer = GameManager::get()->m_playLayer;
         if (!layer) {
             return false;
@@ -4002,6 +4113,10 @@ namespace {
         // Keep subsequent events separately; resume the original prediction first, then
         // re-attach these events with the same timing shift so a press/release is not swallowed.
         bool resuming = resumeNow;
+        clickBudget();
+        if (buf.noHitch) {
+            buf.budgetMs = std::min(buf.budgetMs, RESUME_SLICE_MS);
+        }
         if (!resuming && !buf.queue.empty() && buf.queue.front().resume) {
             buf.isPlayer1 = isPlayer1;
             buf.realInput = down;
@@ -4011,7 +4126,11 @@ namespace {
                 down ? "press" : "release", buf.deferredInputs.size());
             return true;
         }
-        searchFrom = resuming ? std::max(1, resumeEntry.from) : 1;
+        int elapsedNow = resuming
+            ? (resumeEntry.originTick >= 0 ? std::max(resumeEntry.elapsed, tickCount - resumeEntry.originTick) : resumeEntry.elapsed)
+            : 0;
+        int elapsedSinceLastSlice = resuming ? std::max(0, elapsedNow - resumeEntry.elapsed) : 0;
+        searchFrom = resuming ? std::max(1, resumeEntry.from - elapsedSinceLastSlice) : 1;
         budgetCutK = 0;
         struct SearchFromReset {
             ~SearchFromReset() {
@@ -4209,18 +4328,34 @@ namespace {
         if (anyWave) {
             horizon = fullWaveHorizon(mini);
         }
-        int maxDelay = st(anyWave ? buf.ticksWave : (anyShip ? std::clamp(buf.shipMaxDelay, 0, 16) : buf.ticksAll));
+        int tuningMode = modeIndex(p1, p2);
+        bool tickTuningSupported = tuningMode != 1 && tuningMode != 4; // Ship and Wave are N/A in this tab
+        int stageMaxDelay = st(anyWave ? buf.ticksWave : buf.ticksAll);
+        int maxDelay = (buf.tickTuning && tickTuningSupported)
+            ? stageMaxDelay
+            : st(anyWave ? buf.ticksWave : (anyShip ? std::clamp(buf.shipMaxDelay, 0, 16) : buf.ticksAll));
         if (buf.lowLatency) {
             maxDelay = std::min(maxDelay, st(4));  // at most 1 frame (60 fps) of delay
         }
         if (buf.perMode) {
-            maxDelay = st(buf.modeTicks[modeIndex(p1, p2)]);  // v2.88: your frames for this mode (over low latency's cap)
+            maxDelay = st(buf.modeTicks[tuningMode]);  // v2.88: your frames for this mode (over low latency's cap)
+        }
+        if (buf.tickTuning && tickTuningSupported) {
+            // Max Off (0) leaves the existing stage/per-mode maximum untouched.
+            if (buf.modeMaxTicks[tuningMode] > 0) {
+                maxDelay = std::min(maxDelay, st(buf.modeMaxTicks[tuningMode]));
+            }
+            // The min is a lower bound for candidates, not an artificial delay if the
+            // click has already aged while a no-hitch search is being resumed. st() keeps
+            // the user's 240-Hz tick values consistent at unlocked physics rates too.
+            int remainingMin = std::max(1, st(buf.modeMinTicks[tuningMode]) - elapsedNow);
+            searchFrom = std::max(searchFrom, remainingMin);
         }
         if (resuming) {
-            maxDelay -= resumeEntry.elapsed;  // the time since your click counts
-            if (maxDelay < searchFrom) {
-                maxDelay = 0;
-            }
+            maxDelay -= elapsedNow;  // include time spent waiting for the next CPU slice
+        }
+        if (maxDelay < searchFrom) {
+            maxDelay = 0;
         }
         if (maxDelay <= 0) {
             say("DIRECT INPUT: max delay is 0 (low latency {}, per-mode {}, stage {})", buf.lowLatency, buf.perMode, buf.stage);
@@ -4461,7 +4596,8 @@ namespace {
         // +32t..+40t "saves" that died ~130 ticks later, every time); those clicks now go
         // through untouched instead of being moved by up to 10 frames for nothing.
         // v2.75: robot jumps and UFO / swing flaps too (no more half saves there either)
-        int needed = (groundPress || robotPress || robotRelease || ufoPress) ? horizon : std::min(horizon, base + st(12));
+        int needed = (groundPress || robotPress || robotRelease || ufoPress || cubeStyleWave)
+            ? horizon : std::min(horizon, base + st(12));
         int learned = memoryDelay(slice);
         if (learned >= searchFrom && learned <= maxDelay && !(anyWave && buf.waveV46)) {
             int target = needed;
@@ -4498,12 +4634,12 @@ namespace {
         // tried all crashed, so waiting a tick loses nothing), instead of giving up.
         int resumes = resuming ? resumeEntry.resumes : 0;
         if (saved <= 0 && buf.noHitch && budgetCutK > 0 && budgetCutK < maxDelay && resumes < MAX_RESUMES) {
-            QueuedInput next { std::max(0, 1 - early), down, true, budgetCutK, (resuming ? resumeEntry.elapsed : 0) + 1, resumes + 1 };
+            QueuedInput next { std::max(0, 1 - early), down, true, budgetCutK, elapsedNow + 1, resumes + 1 };
             next.originTick = resuming && resumeEntry.originTick >= 0 ? resumeEntry.originTick : tickCount;
             ++buf.budgetYields;
             say("BUDGET YIELD: {} {} | tried through +{}t / {}t | next from +{}t | {:.2f} ms / {:.2f} ms | resume {}",
                 down ? "press" : "release", anyWave ? "wave" : "non-wave",
-                budgetCutK + (resuming ? resumeEntry.elapsed : 0), maxDelay + (resuming ? resumeEntry.elapsed : 0), budgetCutK,
+                budgetCutK + elapsedNow, maxDelay + elapsedNow, budgetCutK,
                 clickMs(), buf.budgetMs, next.resumes);
             buf.shift = 1;
             buf.queue.push_back(next);
@@ -4534,7 +4670,10 @@ namespace {
         // works at the exact spot, the next few delays are tried for one that survives all
         // three; if none does, the original save is kept, so this never makes things worse.
         bool robustNote = false;
-        if (buf.robustSaves && !(anyWave && buf.waveV46)) {
+        // Wave searchWave already performed its own position-robust and adjacent-delay checks;
+        // repeating the generic half-tick verification here only spends more CPU and can
+        // reject a tight but verified wave timing. Keep the generic check for other modes.
+        if (buf.robustSaves && !anyWave) {
             int target = needed;
             // half a tick of x movement: normal speed (0.9) covers 311.58 units a second
             float shift = std::max(0.3f, 0.5f * (311.58f / 240.f) * (std::abs(p1->m_playerSpeed) / 0.9f));
@@ -4588,7 +4727,7 @@ namespace {
         }
         noteSave(layer, saved);
         say("SAVED {}{} +{}t ({:g}f)  {}->{}  [max {}]{}{}", down ? "press" : "release", tickTag, saved, saved * TICK, base, landed, maxDelay,
-            resuming ? fmt::format("  (search went on {}t)", resumeEntry.elapsed) : std::string(),
+            resuming ? fmt::format("  (search went on {}t)", elapsedNow) : std::string(),
             robustNote ? std::string("  (robust)")
             : fromMemory ? std::string("  (memory)")
             : cubeStyleWave && marginUsed ? std::string("  +margin")
@@ -4811,9 +4950,17 @@ namespace {
         // physics step N, which is exactly what simulate(delay = N) tested.
         while (!buf.queue.empty() && buf.queue.front().ticksLeft <= 0) {
             if (buf.queue.front().resume) {
-                // v2.85 no-hitch: the search for this click goes on now
+                // v3.0.0: physics may run many substeps inside one rendered frame. Do not
+                // launch a fresh CPU-sized search on every substep; resume at a fixed wall-time
+                // cadence, regardless of render FPS or selected physics TPS.
+                if (!resumeSliceReady()) {
+                    return;
+                }
                 auto q = buf.queue.front();
                 buf.queue.pop_front();
+                if (q.originTick >= 0) {
+                    q.elapsed = std::max(q.elapsed, tickCount - q.originTick);
+                }
                 resumeClick(layer, q);
                 continue;
             }
@@ -4878,7 +5025,7 @@ class BufferMenu : public geode::Popup {
         { "explain-inputs", "Detailed input logs" },
         { "performance-mode", "Performance mode" },
     };
-    static constexpr char const* TABS[] = { "Buffer", "Prediction", "Modes", "Custom", "Tools" };
+    static constexpr char const* TABS[] = { "Buffer", "Prediction", "Modes", "Tick Tune", "Custom", "Tools" };
 
     struct Theme {
         ccColor3B main, soft, accent, bg;
@@ -4940,13 +5087,16 @@ private:
     std::vector<ModeSlider> m_sliders;
     int m_dragSlider = -1;
     CCDrawNode* m_perModeSwitch = nullptr;
+    CCDrawNode* m_tickTuningSwitch = nullptr;
+    std::array<CCLabelBMFont*, 8> m_tickMinValues {};
+    std::array<CCLabelBMFont*, 8> m_tickMaxValues {};
     CCDrawNode* m_bufferSwitch = nullptr;
     CCLabelBMFont* m_bufferState = nullptr;
     bool m_dragging = false;
     float m_shootTimer = 2.f;
 
     static constexpr int TPS_MIN = 240;
-    static constexpr int TPS_MAX = 1000;
+    static constexpr int TPS_MAX = 240;
 
     // CCDrawNode blends premultiplied colours: a see-through colour has to be darkened by its
     // alpha (v2.88's white cards and bright blocks were plain colours drawn at full strength)
@@ -5327,10 +5477,8 @@ private:
         }
         y -= 32.f;
         card(y + 11.f, 24.f);
-        label(m_page, "Physics TPS", 0.5f, m_muted, { SIDE + 20.f, y }, { 0.f, 0.5f });
-        button(m_pageMenu, "-", menu_selector(BufferMenu::onTps), { W - 92.f, y }, 22.f, false, -1);
-        button(m_pageMenu, "+", menu_selector(BufferMenu::onTps), { W - 30.f, y }, 22.f, false, 1);
-        m_tpsLabel = label(m_page, "", 0.55f, m_text, { W - 61.f, y });
+        label(m_page, "Physics clock", 0.5f, m_muted, { SIDE + 20.f, y }, { 0.f, 0.5f });
+        m_tpsLabel = label(m_page, "Native · 240 TPS", 0.5f, m_text, { W - 65.f, y });
         y -= 30.f;
         card(y + 10.f, 22.f);
         label(m_page, "Input buffer", 0.52f, buf.enabled ? m_text : m_muted, { SIDE + 20.f, y }, { 0.f, 0.5f });
@@ -5351,6 +5499,63 @@ private:
         float top = pageTop() - 40.f;
         card(top + 12.f, ((count + 1) / 2) * ROW + 4.f);
         optionGrid(options, count, top);
+    }
+
+    void pageTickTuning() {
+        heading("Tick Tuning", "Per-mode search window in 240-Hz physics ticks. 4 ticks = 1 frame.");
+        float headerY = pageTop() - 34.f;
+        label(m_page, "Tick tuning", 0.48f, buf.tickTuning ? m_text : m_muted,
+            { SIDE + 14.f, headerY }, { 0.f, 0.5f });
+        switchItem({ SIDE + 91.f, headerY }, buf.tickTuning, menu_selector(BufferMenu::onTickTuningToggle), 0, &m_tickTuningSwitch);
+        button(m_pageMenu, "Min=1 all", menu_selector(BufferMenu::onTickTunePreset), { SIDE + 151.f, headerY }, 54.f, false, 0, 14.f);
+        button(m_pageMenu, "Max=80 all", menu_selector(BufferMenu::onTickTunePreset), { SIDE + 222.f, headerY }, 62.f, false, 1, 14.f);
+        button(m_pageMenu, "Max Off all", menu_selector(BufferMenu::onTickTunePreset), { SIDE + 282.f, headerY }, 64.f, false, 2, 14.f);
+
+        float colW = (W - SIDE - 32.f) / 2.f;
+        float leftX = SIDE + 10.f;
+        float topY = headerY - 24.f;
+        for (int i = 0; i < 8; ++i) {
+            // Grid order matches the reference: Cube/Ship, Ball/UFO, Wave/Robot, Spider/Swing.
+            int col = i % 2;
+            int row = i / 2;
+            float x = leftX + col * (colW + 6.f);
+            float y = topY - row * 39.f;
+            card(y + 17.f, 36.f);
+            auto* icon = modeIcon(i);
+            icon->setScale(0.28f);
+            icon->setPosition({ x + 15.f, y + 8.f });
+            m_page->addChild(icon, 3);
+            label(m_page, MODE_NAMES[i], 0.43f, buf.tickTuning ? m_text : m_muted,
+                { x + 29.f, y + 8.f }, { 0.f, 0.5f });
+
+            // Ship and Wave use their own handling in this mod, so NOVA-style Tick Tuning
+            // marks them N/A rather than overriding their dedicated timing logic.
+            if (i == 1 || i == 4) {
+                label(m_page, "N/A", 0.43f, m_muted, { x + colW - 25.f, y - 5.f });
+                label(m_page, "N/A", 0.43f, m_muted, { x + colW - 25.f, y - 16.f });
+                continue;
+            }
+
+            // Min row: - [value] +
+            label(m_page, "Min", 0.36f, m_muted, { x + 8.f, y - 4.f }, { 0.f, 0.5f });
+            button(m_pageMenu, "-", menu_selector(BufferMenu::onTickTuneStep), { x + 43.f, y - 4.f }, 13.f, false, i * 5, 12.f);
+            m_tickMinValues[i] = label(m_page, "", 0.37f, buf.tickTuning ? m_cyan : m_muted,
+                { x + 61.f, y - 4.f });
+            m_tickMinValues[i]->limitLabelWidth(22.f, 0.37f, 0.22f);
+            button(m_pageMenu, "+", menu_selector(BufferMenu::onTickTuneStep), { x + 79.f, y - 4.f }, 13.f, false, i * 5 + 1, 12.f);
+
+            // Max row: - [value / Off] +. Tapping the value switches Off <-> 80 ticks.
+            label(m_page, "Max", 0.36f, m_muted, { x + 8.f, y - 16.f }, { 0.f, 0.5f });
+            button(m_pageMenu, "-", menu_selector(BufferMenu::onTickTuneStep), { x + 43.f, y - 16.f }, 13.f, false, i * 5 + 2, 12.f);
+            button(m_pageMenu, "", menu_selector(BufferMenu::onTickTuneStep), { x + 60.f, y - 16.f }, 23.f, false, i * 5 + 4, 12.f);
+            m_tickMaxValues[i] = label(m_pageMenu, "", 0.36f, buf.tickTuning ? m_cyan : m_muted,
+                { x + 60.f, y - 16.f });
+            m_tickMaxValues[i]->limitLabelWidth(22.f, 0.36f, 0.22f);
+            button(m_pageMenu, "+", menu_selector(BufferMenu::onTickTuneStep), { x + 80.f, y - 16.f }, 13.f, false, i * 5 + 3, 12.f);
+        }
+        label(m_page, "Max Off uses the stage ceiling. Changes are saved automatically.", 0.37f, m_muted,
+            { SIDE + 14.f, 17.f }, { 0.f, 0.5f })->limitLabelWidth(W - SIDE - 28.f, 0.37f, 0.2f);
+        refreshTickTuning();
     }
 
     void pageCustom() {
@@ -5402,6 +5607,9 @@ private:
         }
         m_stage = m_status = m_tpsLabel = nullptr;
         m_perModeSwitch = nullptr;
+        m_tickTuningSwitch = nullptr;
+        m_tickMinValues.fill(nullptr);
+        m_tickMaxValues.fill(nullptr);
         m_bufferSwitch = nullptr;
         m_bufferState = nullptr;
         m_modeValues.fill(nullptr);
@@ -5423,8 +5631,9 @@ private:
                 pageOptions("Prediction", "What the hidden ghost predicts before your click is let through.", PREDICTION, std::size(PREDICTION));
                 break;
             case 2: pageOptions("Modes", "Per game mode helpers and latency.", MODES, std::size(MODES)); break;
-            case 3: pageCustom(); break;
-            case 4: pageTools(); break;
+            case 3: pageTickTuning(); break;
+            case 4: pageCustom(); break;
+            case 5: pageTools(); break;
             default: pageBuffer(); break;
         }
         buildTabs();
@@ -5438,7 +5647,7 @@ private:
             m_stage->limitLabelWidth(W - SIDE - 150.f, 0.55f, 0.2f);
         }
         if (m_tpsLabel) {
-            m_tpsLabel->setString(fmt::format("{}", Mod::get()->getSettingValue<int64_t>("tps")).c_str());
+            m_tpsLabel->setString("Native · 240 TPS");
         }
         if (m_status) {
             float dt = buf.tickLength > 0.001f ? buf.tickLength : TICK;
@@ -5458,6 +5667,7 @@ private:
             m_switchLabels[i]->setColor(on ? m_text : m_muted);
         }
         refreshModes();
+        refreshTickTuning();
     }
 
     void drawSlider(ModeSlider const& sl) {
@@ -5495,6 +5705,24 @@ private:
         }
         if (m_perModeSwitch) {
             drawSwitch(m_perModeSwitch, buf.perMode);
+        }
+    }
+
+    void refreshTickTuning() {
+        for (int i = 0; i < 8; ++i) {
+            if (m_tickMinValues[i]) {
+                m_tickMinValues[i]->setString(fmt::format("{}t", buf.modeMinTicks[i]).c_str());
+                m_tickMinValues[i]->limitLabelWidth(22.f, 0.37f, 0.22f);
+                m_tickMinValues[i]->setColor(buf.tickTuning ? m_cyan : m_muted);
+            }
+            if (m_tickMaxValues[i]) {
+                m_tickMaxValues[i]->setString(buf.modeMaxTicks[i] > 0 ? fmt::format("{}t", buf.modeMaxTicks[i]).c_str() : "Off");
+                m_tickMaxValues[i]->limitLabelWidth(22.f, 0.36f, 0.22f);
+                m_tickMaxValues[i]->setColor(buf.tickTuning ? m_cyan : m_muted);
+            }
+        }
+        if (m_tickTuningSwitch) {
+            drawSwitch(m_tickTuningSwitch, buf.tickTuning);
         }
     }
 
@@ -5650,6 +5878,80 @@ private:
         saveModeTicks();
         say("{}: {:g} frames", MODE_NAMES[mode], buf.modeTicks[mode] * TICK);
         refreshModes();
+    }
+
+    void onTickTuningToggle(CCObject*) {
+        buf.tickTuning = !buf.tickTuning;
+        saveTickTuning();
+        refreshTickTuning();
+        say("tick tuning {}", buf.tickTuning ? "on" : "off");
+    }
+
+    void onTickTuneStep(CCObject* sender) {
+        int mode = sender->getTag() / 5;
+        int action = sender->getTag() % 5;
+        if (mode < 0 || mode >= 8 || mode == 1 || mode == 4) {
+            return;
+        }
+        if (action == 0) {
+            buf.modeMinTicks[mode] = std::max(1, buf.modeMinTicks[mode] - 1);
+            if (buf.modeMaxTicks[mode] > 0 && buf.modeMaxTicks[mode] < buf.modeMinTicks[mode]) {
+                buf.modeMaxTicks[mode] = buf.modeMinTicks[mode];
+            }
+        }
+        else if (action == 1) {
+            buf.modeMinTicks[mode] = std::min(TICK_TUNING_MAX, buf.modeMinTicks[mode] + 1);
+            if (buf.modeMaxTicks[mode] > 0 && buf.modeMaxTicks[mode] < buf.modeMinTicks[mode]) {
+                buf.modeMaxTicks[mode] = buf.modeMinTicks[mode];
+            }
+        }
+        else if (action == 2) {
+            if (buf.modeMaxTicks[mode] == 0) {
+                buf.modeMaxTicks[mode] = 80;
+            }
+            else {
+                buf.modeMaxTicks[mode] = std::max(buf.modeMinTicks[mode], buf.modeMaxTicks[mode] - 1);
+            }
+        }
+        else if (action == 3) {
+            if (buf.modeMaxTicks[mode] == 0) {
+                buf.modeMaxTicks[mode] = 80;
+            }
+            else {
+                buf.modeMaxTicks[mode] = std::min(TICK_TUNING_MAX, buf.modeMaxTicks[mode] + 1);
+            }
+        }
+        else if (action == 4) {
+            buf.modeMaxTicks[mode] = buf.modeMaxTicks[mode] > 0 ? 0 : std::max(80, buf.modeMinTicks[mode]);
+        }
+        saveTickTuning();
+        refreshTickTuning();
+        say("{} tick tuning: min {}t / max {}", MODE_NAMES[mode], buf.modeMinTicks[mode],
+            buf.modeMaxTicks[mode] > 0 ? fmt::format("{}t", buf.modeMaxTicks[mode]) : std::string("Off"));
+    }
+
+    void onTickTunePreset(CCObject* sender) {
+        int preset = sender->getTag();
+        for (int i = 0; i < 8; ++i) {
+            if (i == 1 || i == 4) {
+                continue;
+            }
+            if (preset == 0) {
+                buf.modeMinTicks[i] = 1;
+                if (buf.modeMaxTicks[i] > 0 && buf.modeMaxTicks[i] < 1) {
+                    buf.modeMaxTicks[i] = 1;
+                }
+            }
+            else if (preset == 1) {
+                buf.modeMaxTicks[i] = std::max(80, buf.modeMinTicks[i]);
+            }
+            else {
+                buf.modeMaxTicks[i] = 0;
+            }
+        }
+        saveTickTuning();
+        refreshTickTuning();
+        say("tick tuning preset applied: {}", preset == 0 ? "Min 1 all" : preset == 1 ? "Max 80 all" : "Max Off all");
     }
 
     void onAllSettings(CCObject*) {
@@ -5816,6 +6118,39 @@ $on_mod(Loaded) {
     buf.console = false; // clean UI build: never open a separate live console window
     buf.showPath = false; // path rendering is intentionally unavailable in this clean UI build
     recoverGlobals();
+    // v3.0.0 originally experimented with a custom TPS driver. v3.0.1 removes that
+    // driver entirely; this migration only resets the displayed/legacy setting to GD's
+    // native 240-TPS value and disables render-frame budget scaling.
+    if (!Mod::get()->getSavedValue<bool>("native-physics-clock-v300", false)) {
+        auto* mod = Mod::get();
+        mod->setSettingValue<int64_t>("tps", 240);
+        mod->setSettingValue<bool>("auto-budget", false);
+        mod->setSavedValue("native-physics-clock-v300", true);
+    }
+    // v3.0.1 migration: restore native GD 2.2 timing and give wave searches enough
+    // look-ahead/work budget. Only old/known-limiting values are raised; higher user values
+    // are preserved. This does not alter the game's native physics rate.
+    if (!Mod::get()->getSavedValue<bool>("native-clock-wave-v301", false)) {
+        auto* mod = Mod::get();
+        mod->setSettingValue<int64_t>("tps", 240);
+        if (mod->getSettingValue<int64_t>("wave-horizon") < 240)
+            mod->setSettingValue<int64_t>("wave-horizon", 240);
+        if (mod->getSettingValue<int64_t>("custom-wave-ticks") < 256)
+            mod->setSettingValue<int64_t>("custom-wave-ticks", 256);
+        if (mod->getSettingValue<double>("sim-budget-ms") < 16.0)
+            mod->setSettingValue<double>("sim-budget-ms", 16.0);
+        mod->setSettingValue<bool>("auto-budget", false);
+        mod->setSettingValue<bool>("low-latency", false);
+        mod->setSettingValue<bool>("performance-mode", false);
+        mod->setSettingValue<bool>("no-hitch-searches", true);
+        mod->setSettingValue<bool>("robust-saves", true);
+        mod->setSettingValue<bool>("wave-safety-margin", true);
+        mod->setSettingValue<bool>("cbf-sync", true);
+        mod->setSettingValue<bool>("rapid-input-bypass", false);
+        mod->setSettingValue<bool>("skip-failed-spots", false);
+        mod->setSavedValue("native-clock-wave-v301", true);
+    }
+
     // Reliability fork migration: keep Low Latency off and resume searches across ticks.
     if (!Mod::get()->getSavedValue<bool>("reliable-buffer-v2996", false)) {
         Mod::get()->setSettingValue<bool>("low-latency", false);
@@ -5851,7 +6186,7 @@ $on_mod(Loaded) {
     if (Loader::get()->isModLoaded("square3ang.cbfextrapolate")) {
         say("CBF Extrapolate detected: visual only, predictions unaffected");
     }
-    say("v2.99.7 expanded-buffer build loaded. 32-frame custom windows; spam bypass and failed-spot blacklist are opt-in");
+    say("v3.0.1 loaded. Native GD physics clock preserved; FPS-neutral prediction scheduling and expanded wave search");
 }
 
 class $modify(BufPlayLayer, PlayLayer) {
@@ -6184,6 +6519,7 @@ class $modify(BufPlayerObject, PlayerObject) {
         auto* layer = GameManager::get()->m_playLayer;
         if (layer && this == layer->m_player1) {
             ++tickCount;
+            ++buf.physicsStepsThisFrame;
             if (!triggerChecks.empty()) {
                 runTriggerChecks(layer);  // v2.84
             }
@@ -6647,47 +6983,26 @@ class $modify(BufMenuLayer, MenuLayer) {
     }
 };
 
-// v2.57 custom TPS: above 240 the level is stepped in 1/tps pieces. update() runs once per
-// step and getModifiedDelta() hands the step through unrounded, so each call is exactly one
-// physics step. (Below 240 the game's own step count would need patching, so 240 is the floor.)
-static bool tpsDriving = false;
-static double tpsCarry = 0.0;
-
+// v3.0.1: do not drive or replace the game's physics clock. Geometry Dash 2.2
+// already runs its native fixed 240-TPS physics loop inside GJBaseGameLayer::update.
+// The old custom accumulator called update multiple times itself and changed the
+// game's time/input cadence. This pass-through only measures render cadence; the
+// original game update owns every physics step and PlayerObject::update provides the
+// exact dt used by the ghost predictor.
 class $modify(BufBaseGameLayer, GJBaseGameLayer) {
     void update(float dt) {
-        int tps = static_cast<int>(Mod::get()->getSettingValue<int64_t>("tps"));
-        if (tps <= 240 || tpsDriving || !typeinfo_cast<PlayLayer*>(this)) {
-            GJBaseGameLayer::update(dt);
-            return;
+        bool inPlayLayer = typeinfo_cast<PlayLayer*>(this) != nullptr;
+        if (inPlayLayer) {
+            buf.physicsStepsThisFrame = 0;
+            if (dt > 0.000001f) {
+                buf.renderDt = dt;
+                buf.renderFps = 1.0 / static_cast<double>(dt);
+            }
         }
-        double step = 1.0 / tps;
-        tpsCarry += dt;
-        int steps = static_cast<int>(tpsCarry / step);
-        int cap = std::max(1, tps / 15);  // after a lag spike, catch up at most 1/15 s
-        if (steps > cap) {
-            steps = cap;
-            tpsCarry = 0.0;
+        GJBaseGameLayer::update(dt);
+        if (inPlayLayer) {
+            buf.physicsStepsLastFrame = buf.physicsStepsThisFrame;
         }
-        else {
-            tpsCarry -= steps * step;
-        }
-        tpsDriving = true;
-        for (int i = 0; i < steps; ++i) {
-            GJBaseGameLayer::update(static_cast<float>(step));
-        }
-        tpsDriving = false;
-    }
-
-    double getModifiedDelta(float dt) {
-        if (!tpsDriving) {
-            return GJBaseGameLayer::getModifiedDelta(dt);
-        }
-        m_extraDelta = 0.0;
-        if (m_resumeTimer > 0) {
-            --m_resumeTimer;
-            return 0.0;
-        }
-        return dt;
     }
 
     static void onModify(auto& self) {

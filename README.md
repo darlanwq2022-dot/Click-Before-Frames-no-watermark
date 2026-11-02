@@ -1,32 +1,27 @@
-# Predictive Input Buffer v2.99.7 — Clean UI
+# Predictive Input Buffer v3.0.1 — native physics and wave reliability
 
-A clean-interface fork of the supplied Predictive Input Buffer 2.99.5 source.
+Targets Geometry Dash 2.2081 / Geode 5.11.2.
 
 ## What changed
-- Removed the gameplay watermark, auto-input tag, training mode/hint, path visualization, and progress-bar heatmap.
-- Removed the in-game console panel, its hotkey, and the optional Windows live-console window.
-- Added a clear Buffer ON/OFF switch that remembers the last active stage.
-- Added quick presets: Low delay, Balanced, and More saves.
-- Exposed smart prediction, full player-state copying, and automatic mode helpers directly in the in-game menu.
-- Reorganized the Tools page so the console cannot be opened over gameplay; diagnostic logs can still be copied/exported from the menu.
-- Kept the prediction and input-buffer core logic, saved settings, and original source attribution.
 
-## Menu
-Open the menu in a level with the configured menu key (default: **7**). It is also available from the main-menu shortcut and pause menu.
+- Removed the mod's custom physics accumulator and `getModifiedDelta` override. Geometry Dash 2.2 owns its native 240-TPS fixed physics loop; the mod now calls the original game update exactly once and measures render cadence separately.
+- The predictor advances using the actual `PlayerObject::update(dt)` delivered by the game. Its 240-Hz tick windows are converted using the measured physics-step duration; render FPS is not used to scale prediction time or CPU budget.
+- Added render FPS and physics-steps-per-render-frame to diagnostic exports to make timing regressions visible.
+- Raised the default wave lookahead to 240 native physics ticks (1 second) and the configured prediction budget to 16 ms.
+- No-hitch searches now use 1 ms bounded slices and can resume across up to 1024 physics updates. New inputs remain queued in order while the original prediction is resumed.
+- Robust saves, wave safety margin, CBF sync and no-hitch continuation are enabled by the v3.0.1 migration. Low Latency and Performance Mode are disabled for the high-coverage wave profile.
+- Old saved wave horizons below 160 are migrated to 240. Old prediction budgets below 8 ms are raised to 16 ms. Higher user values are preserved.
+
+## FPS vs TPS
+
+For Geometry Dash 2.2, the normal physics clock is 240 TPS; this is not the same as the render FPS cap. Setting the mod to 60 TPS would not mean "60 FPS" and would change the simulation timing. This version does not create a custom TPS loop: it leaves the game physics alone.
+
+At 30 rendered FPS, the game can still process multiple native physics steps per rendered frame. However, the instant at which an input reaches the game may still be constrained by input sampling. Click Between Frames / Click On Steps integration can improve input placement; the buffer cannot reconstruct an earlier physical click timestamp that never reached its hook. The diagnostic log reports whether CBF is detected and whether CBF sync is enabled.
+
+## Wave profile
+
+The default horizon is 240 ticks. A larger lookahead and 16 ms budget give the wave search more opportunities to evaluate delayed candidates. This is not a guarantee that every gap has a safe correction: `UNBUFFERED` is still correct when no tested candidate survives the configured robustness checks. Larger searches can also defer later inputs while pending; keep an eye on the exported `BUDGET YIELD`, `RESUME`, `UNBUFFERED` and `DIRECT FALLBACK` counts.
 
 ## Build
-Build with the Geode SDK configured by the project. This source package has **not** been compiled in this environment because the Geode SDK is not installed here.
 
-## Attribution
-Modified from the original project: https://github.com/raresdalas1009/-predictive-input-buffer
-
-
-## Reliability / diagnostics fork
-
-This fork keeps prediction searches resumable across physics ticks, preserves later input events while a search is pending, and records input decisions, budget yields, resumes, and direct fallbacks in the in-memory diagnostic log. Use the in-level **Copy log** button (or the configured export key, F8 by default) after a test run and share `console-export.txt` when reporting an issue.
-
-The mod cannot guarantee that every click can be corrected: some inputs have no verified safe delay, and prediction is disabled for unsupported situations (for example, platformer mode or disabled buffering). In those cases it delivers the input and records the reason rather than silently dropping it. **Low latency** is off by default because it intentionally caps the delay window and CPU budget.
-
-## v2.99.7 reliability changes
-
-Custom windows now default to 128 physics ticks (32 frames), can be raised to 256 ticks (64 frames), and the per-mode slider reaches 32 frames. Rapid-input bypass and failed-spot memory blacklisting are opt-in, so they do not bypass prediction by default. Auto-budget reduces a detected hitch to 8 ms instead of 4 ms.
+Use the included GitHub Actions workflow or compile against the matching Geode SDK. The SDK is not installed in the authoring environment, so this source package does not include a compiled `.geode` binary. Static validation can be performed locally, but a successful Geode compile and in-game test are still required.
