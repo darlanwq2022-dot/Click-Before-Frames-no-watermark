@@ -1,32 +1,31 @@
-# Predictive Input Buffer v3.0.2 — native physics and wave reliability
+# Predictive Input Buffer v3.0.3 — wave timing and FPS diagnostics
 
 Targets Geometry Dash 2.2081 / Geode 5.11.2.
 
-## v3.0.2 build fix
+## v3.0.3 — fix for the reported DIOOZ GOD behavior
 
-- Fixed the compile error in `alignOrb`: the resumed-search lower bound (`searchFrom`) is now passed explicitly into the orb-alignment routine instead of being referenced before its declaration.
-- Marked the popup `init()` method as `override`, removing the corresponding Clang warning.
-- No gameplay behavior, physics timing, or prediction limits were changed by this build-only patch.
+The v3.0.2 log showed that the mod was active but Wave rejected nearly every candidate. The previous v3 wave search required a single isolated toggle to survive the full 225/240-tick lookahead. That is not a sound criterion for continuous Wave steering: the player's next opposite input is part of the actual control sequence and is normally queued with the same delay. A candidate could improve the immediate gap yet be rejected because the simulated button was held for almost a second.
 
-## What changed in v3.0.1
+- Wave search now scores a local danger window (baseline survival + 12 physics ticks) instead of requiring one button state to survive the entire lookahead.
+- If the next opposite Wave input has been observed before, the predictor learns the player's press-hold duration and release-to-press gap, then includes that next toggle in the ghost simulation.
+- The real follow-up input is still queued with the original delay, preserving the player's press/release rhythm.
+- If no timing sample exists yet, the first press uses a conservative one-physics-tick hold estimate; release-to-press timing is not guessed until a real cycle is observed.
+- Wave timing margin now prefers the centre of a contiguous safe timing window, but still accepts a verified narrow window rather than rejecting it for lacking adjacent safe delays.
+- The full wave horizon remains available for trajectory/recovery checks; it is no longer used as the minimum survival requirement for every individual input.
+- Diagnostic output distinguishes per-search-slice budget from the configured budget.
+- Physics steps per rendered frame are now reported as a rolling average over the last 120 rendered frames. A single zero-step render frame at high FPS is normal and is no longer shown as the average.
 
-- Removed the mod's custom physics accumulator and `getModifiedDelta` override. Geometry Dash 2.2 owns its native 240-TPS fixed physics loop; the mod now calls the original game update exactly once and measures render cadence separately.
-- The predictor advances using the actual `PlayerObject::update(dt)` delivered by the game. Its 240-Hz tick windows are converted using the measured physics-step duration; render FPS is not used to scale prediction time or CPU budget.
-- Added render FPS and physics-steps-per-render-frame to diagnostic exports to make timing regressions visible.
-- Raised the default wave lookahead to 240 native physics ticks (1 second) and the configured prediction budget to 16 ms.
-- No-hitch searches now use 1 ms bounded slices and can resume across up to 1024 physics updates. New inputs remain queued in order while the original prediction is resumed.
-- Robust saves, wave safety margin, CBF sync and no-hitch continuation are enabled by the v3.0.1 migration. Low Latency and Performance Mode are disabled for the high-coverage wave profile.
-- Old saved wave horizons below 160 are migrated to 240. Old prediction budgets below 8 ms are raised to 16 ms. Higher user values are preserved.
+## What the v3.0.1 native-clock change means
 
-## FPS vs TPS
+Geometry Dash 2.2 owns its native 240-TPS physics loop. The mod does not force 60, 240 or 960 TPS and does not use render FPS to scale prediction time. At 30 rendered FPS the game can process several physics steps per rendered frame; at 480 rendered FPS many rendered frames can contain zero physics steps while the average remains around 240 physics updates per second.
 
-For Geometry Dash 2.2, the normal physics clock is 240 TPS; this is not the same as the render FPS cap. Setting the mod to 60 TPS would not mean "60 FPS" and would change the simulation timing. This version does not create a custom TPS loop: it leaves the game physics alone.
+Click Between Frames / Click On Steps integration can improve the timestamp at which an input reaches the game. The buffer cannot reconstruct a physical click timestamp that never reaches its input hook.
 
-At 30 rendered FPS, the game can still process multiple native physics steps per rendered frame. However, the instant at which an input reaches the game may still be constrained by input sampling. Click Between Frames / Click On Steps integration can improve input placement; the buffer cannot reconstruct an earlier physical click timestamp that never reached its hook. The diagnostic log reports whether CBF is detected and whether CBF sync is enabled.
+## Wave profile and limits
 
-## Wave profile
+The default wave horizon is 240 native physics ticks. The maximum delay setting controls how far the mod may move an input; it does not guarantee that a safe timing exists. The local wave scoring criterion is intended to make the buffer useful across successive press/release events without pretending that one toggle can steer through a whole section alone.
 
-The default horizon is 240 ticks. A larger lookahead and 16 ms budget give the wave search more opportunities to evaluate delayed candidates. This is not a guarantee that every gap has a safe correction: `UNBUFFERED` is still correct when no tested candidate survives the configured robustness checks. Larger searches can also defer later inputs while pending; keep an eye on the exported `BUDGET YIELD`, `RESUME`, `UNBUFFERED` and `DIRECT FALLBACK` counts.
+`UNBUFFERED` means the simulator did not verify a useful timing within the tested delay window. It is distinct from `DIRECT FALLBACK`, which is a search interruption caused by budget/resume limits. Keep the exported `wave`, `SAVED`, `UNBUFFERED`, `BUDGET YIELD` and `RESUME` diagnostics when reporting a failed gap.
 
 ## Build
 

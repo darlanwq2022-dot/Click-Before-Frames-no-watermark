@@ -211,6 +211,11 @@ namespace {
         float renderDt = 1.f / 60.f;
         int physicsStepsThisFrame = 0;
         int physicsStepsLastFrame = 0;
+        // Rolling render/physics ratio; a single render frame can legitimately contain
+        // zero physics updates at high FPS, so diagnostics must not report that sample
+        // as the game's average cadence.
+        std::deque<int> physicsStepFrameSamples;
+        double physicsStepsPerFrameAverage = 4.0;
         int sinceInput = 999;
         int rapid = 0;
 
@@ -792,9 +797,9 @@ namespace {
                 layer->m_isPracticeMode ? ", practice" : "");
         }
         float dt = buf.tickLength > 0.001f ? buf.tickLength : TICK;
-        text += fmt::format("{} | physics step ~{:.3f} ms | {} P1 physics steps/render frame | render ~{:.1f} FPS\n",
-            stageText(), static_cast<double>(dt) * (1000.0 / 60.0), buf.physicsStepsLastFrame, buf.renderFps);
-        text += fmt::format("budget {:g} ms (configured {:g}) | auto budget {} | no-hitch {} | low latency {} | smart {} | full state {} | robust {} | late crash {} | practice only {}\n", buf.budgetMs,
+        text += fmt::format("{} | physics step ~{:.3f} ms | avg {:.2f} P1 physics steps/render frame | render ~{:.1f} FPS\n",
+            stageText(), static_cast<double>(dt) * (1000.0 / 60.0), buf.physicsStepsPerFrameAverage, buf.renderFps);
+        text += fmt::format("search-slice budget {:g} ms (configured budget {:g} ms) | auto budget {} | no-hitch {} | low latency {} | smart {} | full state {} | robust {} | late crash {} | practice only {}\n", buf.budgetMs,
             buf.userBudget, buf.autoBudget, buf.noHitch, buf.lowLatency, buf.smart, buf.fullState, buf.robustSaves, buf.lateCrash, buf.practiceOnly);
         text += fmt::format("tick tuning: {} | values are 240-Hz physics ticks (1 tick = 0.25 frame at 60 FPS)\n", buf.tickTuning ? "ON" : "OFF");
         for (int i = 0; i < 8; ++i) {
@@ -810,8 +815,9 @@ namespace {
             buf.inputSequence, buf.budgetYields, buf.resumeCount, buf.deferredCount, buf.directFallbackCount, buf.queue.size(), buf.deferredInputs.size());
         text += fmt::format("orbs: align {} (ground {}, {}t) timing {} assume {} both {} | memory {} ({} spots) | skip failed spots {}\n", buf.orbAlign,
             buf.orbAlignGround, buf.orbWindow, buf.orbTiming, buf.assumeOrbs, buf.tryBothOrbs, buf.learn, memorySpots(), buf.skipFailedSpots);
-        text += fmt::format("wave: v4.6 {} margin {} horizon {} spam gap {} streak {} rapid bypass {} | robot smart {} | spider smart {} | ship {} (max {}t)\n",
-            buf.waveV46, buf.waveMargin, buf.waveHorizon, buf.spamGap, buf.spamStreak, buf.rapidInputBypass, buf.robotSmart, buf.spiderSmart, buf.shipBuffer, buf.shipMaxDelay);
+        text += fmt::format("wave: v4.6 {} margin {} horizon {} learned press-hold {}t release-gap {}t next-toggle {}t | spam gap {} streak {} rapid bypass {} | robot smart {} | spider smart {} | ship {} (max {}t)\n",
+            buf.waveV46, buf.waveMargin, buf.waveHorizon, wavePressHold.pick(-1, 50), waveReleaseGap.pick(-1, 50), waveNextToggleAfter,
+            buf.spamGap, buf.spamStreak, buf.rapidInputBypass, buf.robotSmart, buf.spiderSmart, buf.shipBuffer, buf.shipMaxDelay);
         text += fmt::format("auto-release: wave {} robot {} dash {} | auto-click {} | normal runs {} window {} | movers: avoid {} predict {}\n",
             buf.autoRelease, buf.robotAutoRelease, buf.dashAutoRelease, buf.autoClick, buf.autoNormalRuns, buf.autoWindow, buf.avoidMovers,
             buf.predictMovers);
@@ -1143,6 +1149,8 @@ namespace {
     };
 
     HoldStats tapHold, robotHold;
+    HoldStats wavePressHold, waveReleaseGap;
+    int waveReleaseTick = -1;
     int tickCount = 0;
 
     enum class InputKind { Tap, Wave, Robot, Other };
@@ -1163,28 +1171,42 @@ namespace {
 
     void recordRealInput(bool down, PlayerObject* p1) {
         if (down) {
+            InputKind currentKind = kindOf(p1);
+            if (currentKind == InputKind::Wave && waveReleaseTick >= 0 && wavePressHold.count > 0) {
+                int gap = tickCount - waveReleaseTick;
+                if (gap > 0) waveReleaseGap.add(gap);
+                waveReleaseTick = -1;
+            }
             pressTick = tickCount;
-            pressKind = kindOf(p1);
+            pressKind = currentKind;
             return;
         }
         if (pressTick < 0) {
+            if (kindOf(p1) == InputKind::Wave) waveReleaseTick = tickCount;
             return;
         }
         int held = tickCount - pressTick;
         pressTick = -1;
-        if (buf.autoReleased) {
-            return;  // the game already let go earlier; this length isn't a real hold
-        }
+        if (buf.autoReleased) return;
         switch (pressKind) {
             case InputKind::Tap: tapHold.add(held); break;
             case InputKind::Robot: robotHold.add(held); break;
+            case InputKind::Wave:
+                wavePressHold.add(held);
+                waveReleaseTick = tickCount;
+                break;
             default: break;
         }
+    }
+
+    int waveNextToggleEstimate(bool currentDown) {
+        return currentDown ? wavePressHold.pick(st(1), 50) : waveReleaseGap.pick(-1, 50);
     }
 
     // A hold that spans a death / restart / new level isn't a real tap length.
     void forgetPress() {
         pressTick = -1;
+        waveReleaseTick = -1;
     }
 
     int holdEstimate() {
@@ -3155,6 +3177,7 @@ namespace {
     // previous tick), and where the last search ran out of time (0 = it didn't)
     int searchFrom = 1;
     int budgetCutK = 0;
+    int waveNextToggleAfter = -1;
     // set while a search is going on from a previous tick
     bool resumeNow = false;
     QueuedInput resumeEntry {};
@@ -3184,8 +3207,11 @@ namespace {
     // turn-away checks are skipped (v2.10: saves most of the work in the search).
     int waveScore(PlayLayer* layer, PlayerObject* p1, PlayerObject* p2, bool dual, int delay, bool down, int horizon, int target,
         SimEnd* end) {
-        int ret = simulateOrbs(layer, p1, p2, dual, delay, down, horizon, -1, target, end);
-        if (ret >= target || *end == SimEnd::StopSearch) {
+        int followUp = waveNextToggleAfter > 0 && waveNextToggleAfter < horizon ? waveNextToggleAfter : -1;
+        int ret = simulateOrbs(layer, p1, p2, dual, delay, down, horizon, followUp, target, end);
+        if (ret >= target || *end == SimEnd::StopSearch || followUp >= 0) {
+            // A known next toggle is a real continuation of the player's input pattern;
+            // do not add a second, invented recovery toggle on top of it.
             return ret;
         }
         for (int margin : WAVE_TURN_MARGINS) {
@@ -3423,10 +3449,11 @@ namespace {
 
     int searchWave(PlayLayer* layer, PlayerObject* p1, PlayerObject* p2, bool dual, bool down, int horizon, int maxDelay, int base,
         int* landed) {
-        // Wave timing is unusually sensitive: accepting only base+12 ticks made a click look
-        // "saved" even when the corrected path still died almost immediately. Search against
-        // the full look-ahead, verify the candidate with a small position offset on both sides,
-        // and prefer the middle of a contiguous safe timing window.
+        // Wave is continuously steered. Requiring one isolated toggle to survive the entire
+        // 225/240-tick horizon is fundamentally too strict: the player's next opposite input
+        // is part of the real control sequence and will be shifted with this one once queued.
+        // Judge this toggle by whether it safely clears the next local danger window, then let
+        // the normal input queue preserve the actual press/release rhythm.
         marginUsed = false;
         using clock = std::chrono::steady_clock;
         auto start = clock::now();
@@ -3435,44 +3462,20 @@ namespace {
         dbgBestRet = -1;
         budgetCutK = 0;
 
-        const float speedRatio = std::abs(p1->m_playerSpeed) / 0.9f;
-        // Tight wave corridors can have a one-tick safe window. Test a lighter quarter-tick
-        // positional perturbation here (instead of the generic half-tick check); the separate
-        // adjacent-delay margin still prefers the centre when multiple timings are safe.
-        const float robustShift = std::max(0.12f, 0.25f * (311.58f / 240.f) * speedRatio);
-        auto waveAt = [&](int delay, float offset, int target) {
-            buf.ghostShiftX = offset;
+        // A useful wave correction must buy at least 12 physics ticks over the current path.
+        // This is a local decision horizon, not a claim that one direction can carry the wave
+        // through the entire level without another player input.
+        const int target = std::min(horizon, base + st(12));
+        say("wave search: local target {}t | horizon {}t | delay window {}..{}t", target, horizon, searchFrom, maxDelay);
+
+        auto waveAt = [&](int delay, int runTarget) {
             SimEnd e;
-            int ret = waveScore(layer, p1, p2, dual, delay, down, horizon, target, &e);
-            buf.ghostShiftX = 0.f;
+            int ret = waveScore(layer, p1, p2, dual, delay, down, horizon, runTarget, &e);
             return std::pair<int, SimEnd>{ ret, e };
         };
-        auto robustAt = [&](int delay, int target) {
-            auto center = waveAt(delay, 0.f, target);
-            if (center.second == SimEnd::StopSearch || center.first < target) {
-                return false;
-            }
-            if (!buf.robustSaves) {
-                return true;
-            }
-            auto ahead = waveAt(delay, robustShift, target);
-            if (ahead.second == SimEnd::StopSearch || ahead.first < target) {
-                return false;
-            }
-            auto behind = waveAt(delay, -robustShift, target);
-            return behind.second != SimEnd::StopSearch && behind.first >= target;
-        };
-
-        // A secondary score keeps a genuinely useful partial save available if no delay can
-        // survive the entire look-ahead. Score total time from the original input, not just the
-        // time after the delayed toggle (k + survived).
-        int bestPartialK = 0;
-        int bestPartialRet = -1;
-        int bestPartialTotal = base;
-        const int partialGain = st(12);
 
         for (int k = searchFrom; k <= maxDelay; ++k) {
-            auto [ret, end] = waveAt(k, 0.f, horizon);
+            auto [ret, end] = waveAt(k, target);
             if (ret > dbgBestRet) {
                 dbgBestRet = ret;
                 dbgBestK = k;
@@ -3481,64 +3484,31 @@ namespace {
                 return 0;
             }
 
-            if (ret >= horizon) {
-                // Verify a full-horizon save with a position perturbation. This rejects a
-                // one-pixel/one-substep "perfect" path that has no room for simulation drift.
-                if (robustAt(k, horizon)) {
-                    int chosen = k;
-                    // Check two adjacent timings. When all three work, use the centre of the
-                    // safe band rather than its earliest, most fragile edge.
-                    if (buf.waveMargin && k + 2 <= maxDelay) {
-                        auto n1 = waveAt(k + 1, 0.f, horizon);
-                        auto n2 = n1.first >= horizon && n1.second != SimEnd::StopSearch
-                            ? waveAt(k + 2, 0.f, horizon) : std::pair<int, SimEnd>{ 0, SimEnd::StopSearch };
-                        if (n1.first >= horizon && n1.second != SimEnd::StopSearch &&
-                            n2.first >= horizon && n2.second != SimEnd::StopSearch && robustAt(k + 1, horizon)) {
-                            chosen = k + 1;
-                            marginUsed = true;
-                        }
+            if (ret >= target) {
+                int chosen = k;
+                // Prefer the centre of a contiguous safe timing window when one exists.
+                // Do not reject a narrow one-tick window merely because nearby timings fail;
+                // the earliest verified candidate remains usable in that case.
+                if (buf.waveMargin && k + 2 <= maxDelay) {
+                    auto n1 = waveAt(k + 1, target);
+                    auto n2 = n1.first >= target && n1.second != SimEnd::StopSearch
+                        ? waveAt(k + 2, target) : std::pair<int, SimEnd>{ 0, SimEnd::StopSearch };
+                    if (n1.first >= target && n1.second != SimEnd::StopSearch &&
+                        n2.first >= target && n2.second != SimEnd::StopSearch) {
+                        chosen = k + 1;
+                        marginUsed = true;
                     }
-                    *landed = horizon;
-                    say("wave: full-horizon save +{}t{}{}", chosen,
-                        buf.robustSaves ? " (position-robust)" : "",
-                        marginUsed ? " (middle of safe window)" : "");
-                    return chosen;
                 }
-            }
-            else {
-                int total = k + ret;
-                if (total > bestPartialTotal) {
-                    bestPartialTotal = total;
-                    bestPartialK = k;
-                    bestPartialRet = ret;
-                }
+                *landed = ret;
+                say("wave: local-window save +{}t | survived {}t / target {}t{}", chosen, ret, target,
+                    marginUsed ? " (centre of safe timing window)" : "");
+                return chosen;
             }
 
             if (std::chrono::duration<double, std::milli>(clock::now() - start).count() > budget) {
-                // If no full-horizon solution has appeared yet, a clearly better and robust
-                // partial trajectory can still be preferable to sending the original timing.
-                // It must buy at least 12 real physics-time ticks, not just survive 12 ticks
-                // after an arbitrarily late delivery.
-                if (bestPartialK > 0 && bestPartialTotal >= base + partialGain) {
-                    int needAfter = std::clamp(base + partialGain - bestPartialK, 1, horizon);
-                    if (robustAt(bestPartialK, needAfter)) {
-                        *landed = bestPartialRet;
-                        say("wave: partial but robust save +{}t | total survival {}t -> {}t", bestPartialK, base, bestPartialTotal);
-                        return bestPartialK;
-                    }
-                }
-                say("prediction budget hit at wave delay +{}t (full horizon {}t)", k, horizon);
-                budgetCutK = k; // after the next physics step this is the remaining delay for the next absolute candidate
+                say("prediction budget hit at wave delay +{}t (local target {}t)", k, target);
+                budgetCutK = k;
                 return 0;
-            }
-        }
-
-        if (bestPartialK > 0 && bestPartialTotal >= base + partialGain) {
-            int needAfter = std::clamp(base + partialGain - bestPartialK, 1, horizon);
-            if (robustAt(bestPartialK, needAfter)) {
-                *landed = bestPartialRet;
-                say("wave: partial but robust save +{}t | total survival {}t -> {}t", bestPartialK, base, bestPartialTotal);
-                return bestPartialK;
             }
         }
         return 0;
@@ -4229,6 +4199,7 @@ namespace {
         bool p1Wave = p1->m_isDart;
         bool anyWave = p1Wave || (p2 && p2->m_isDart);
         bool mini = (p1Wave && p1->m_vehicleSize < 1.f) || (p2 && p2->m_isDart && p2->m_vehicleSize < 1.f);
+        waveNextToggleAfter = anyWave ? waveNextToggleEstimate(down) : -1;
 
         // Wave spam: don't fight fast inputs. Counted for every input, including ones made
         // while a delayed input is waiting (v2.5.1 skipped those, so a spam that started
@@ -4596,8 +4567,9 @@ namespace {
         // +32t..+40t "saves" that died ~130 ticks later, every time); those clicks now go
         // through untouched instead of being moved by up to 10 frames for nothing.
         // v2.75: robot jumps and UFO / swing flaps too (no more half saves there either)
-        int needed = (groundPress || robotPress || robotRelease || ufoPress || cubeStyleWave)
-            ? horizon : std::min(horizon, base + st(12));
+        int needed = cubeStyleWave ? std::min(horizon, base + st(12))
+            : (groundPress || robotPress || robotRelease || ufoPress) ? horizon
+            : std::min(horizon, base + st(12));
         int learned = memoryDelay(slice);
         if (learned >= searchFrom && learned <= maxDelay && !(anyWave && buf.waveV46)) {
             int target = needed;
@@ -7002,6 +6974,18 @@ class $modify(BufBaseGameLayer, GJBaseGameLayer) {
         GJBaseGameLayer::update(dt);
         if (inPlayLayer) {
             buf.physicsStepsLastFrame = buf.physicsStepsThisFrame;
+            buf.physicsStepFrameSamples.push_back(buf.physicsStepsThisFrame);
+            constexpr size_t CADENCE_SAMPLE_FRAMES = 120;
+            if (buf.physicsStepFrameSamples.size() > CADENCE_SAMPLE_FRAMES) {
+                buf.physicsStepFrameSamples.pop_front();
+            }
+            int stepSum = 0;
+            for (int count : buf.physicsStepFrameSamples) {
+                stepSum += count;
+            }
+            buf.physicsStepsPerFrameAverage = buf.physicsStepFrameSamples.empty()
+                ? 0.0
+                : static_cast<double>(stepSum) / static_cast<double>(buf.physicsStepFrameSamples.size());
         }
     }
 

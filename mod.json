@@ -6,11 +6,11 @@
     "mac": "2.2081",
     "ios": "2.2081"
   },
-  "version": "3.0.2",
+  "version": "3.0.3",
   "id": "basu.input-buffer",
   "name": "Predictive Input Buffer",
   "developer": "BASU",
-  "description": "Native Geometry Dash 2.2 physics clock, render-FPS-independent input prediction, expanded robust wave lookahead and detailed diagnostics.",
+  "description": "Native physics-clock input prediction with learned wave-toggle timing, local wave-window scoring and FPS-neutral diagnostics.",
   "settings": {
     "custom-ticks": {
       "type": "int",
@@ -31,7 +31,7 @@
     "sim-budget-ms": {
       "type": "float",
       "name": "Prediction time budget (ms)",
-      "description": "Total configured prediction work budget. With No-hitch enabled, work is divided into 1 ms slices and resumed on later native physics updates. The budget is not scaled by render FPS.",
+      "description": "Configured prediction budget. With No-hitch enabled, each search slice is capped at 1 ms and the search continues on later native physics updates. The budget is not scaled by render FPS.",
       "default": 16.0,
       "min": 1.0,
       "max": 30.0
